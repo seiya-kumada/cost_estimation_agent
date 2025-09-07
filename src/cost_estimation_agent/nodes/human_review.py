@@ -2,9 +2,22 @@ import re
 import unicodedata
 
 from ..state import EstimationState
+from ._utils import record_node_trace
 
 
 def _prompt_yes_no(msg: str) -> bool:
+    """Yes/No を標準入力で確認するヘルパー関数。
+
+    振る舞い:
+    - プロンプトを表示し、`y`/`yes` は True、`n`/`no` は False を返す。
+    - それ以外の入力は再入力を促し、正しい入力があるまでループする。
+
+    Args:
+    - msg: プロンプト本文（末尾に " [y/n]: " が付与される）。
+
+    Returns:
+    - bool: Yes の場合は True、No の場合は False。
+    """
     while True:
         ans = input(f"{msg} [y/n]: ").strip().lower()
         if ans in ("y", "yes"):  # yes
@@ -15,6 +28,19 @@ def _prompt_yes_no(msg: str) -> bool:
 
 
 def _parse_mass_kg(s: str) -> float | None:
+    """質量(kg)の文字列を数値(float)へ解釈するヘルパー。
+
+    振る舞い:
+    - 全角→半角へ正規化し、単位文字（"kg"/"KG"）と桁区切り（","）を除去。
+    - 直接 `float(...)` で変換を試み、失敗したら正規表現で最初の数値を抽出して再試行。
+    - どちらも失敗した場合は `None` を返す。
+
+    Args:
+    - s: ユーザ入力などの生文字列（例: " １,２３kg "、"約 0.85 kg" など）。
+
+    Returns:
+    - float | None: kg単位の数値。解釈不能なら `None`。
+    """
     # 全角→半角、単位/区切り除去してから数値化
     t = unicodedata.normalize("NFKC", s).strip()
     t = t.replace("kg", "").replace("KG", "")
@@ -33,11 +59,26 @@ def _parse_mass_kg(s: str) -> float | None:
 
 
 def human_in_the_loop_node(state: EstimationState) -> EstimationState:
-    # 取得結果と確信度を提示 → ユーザが確認（Yes/No）→ No の場合は再入力を受け付けて更新
-    trace = state.get("trace", [])
-    trace.append("human_review")
-    state["trace"] = trace
+    """HITL（人手確認）で抽出結果を確定させるノード。
 
+    振る舞い:
+    - 抽出済みの材料(material)、質量(mass_kg)、信頼度(confidence)を表示
+    - ユーザにOK/NGを確認（Yesなら確定し、信頼度を引き上げて次工程へ）
+    - NGなら材料/質量の再入力を受け付け、extracted・issues・confidence を更新
+    - 入力内容を `human_answers` に保存し、trace に "human_review" を追加
+
+    Args:
+    - state: エージェント全体の状態（抽出結果、確信度、HITL回答、エラー、トレース等を含む）。
+
+    Returns:
+    - EstimationState: ユーザ確認／修正を反映した新しい状態。
+      - `extracted`/`extraction_issues`/`extraction_confidence`/`human_answers`/`needs_human` を更新。
+    """
+
+    # 履歴を残す。
+    record_node_trace(state, "human_review")
+
+    # 抽出結果を取得
     extracted = dict(state.get("extracted") or {})
     material = extracted.get("material")
     mass_kg = extracted.get("mass_kg")
@@ -73,13 +114,14 @@ def human_in_the_loop_node(state: EstimationState) -> EstimationState:
             break
         print("数値として解釈できませんでした。再入力してください。")
 
-    # issues を更新
+    # issues を更新(未入力項目を追加)
     issues: list[str] = []
     if not extracted.get("material"):
         issues.append("material")
     if extracted.get("mass_kg") is None:
         issues.append("mass_kg")
 
+    # stateを更新して返す
     state["extracted"] = extracted
     state["human_answers"] = {k: extracted.get(k) for k in ("material", "mass_kg")}
     state["needs_human"] = False  # 入力を受けて次工程へ
@@ -87,7 +129,10 @@ def human_in_the_loop_node(state: EstimationState) -> EstimationState:
     # 入力で確度を回復（両方あれば 0.95、片方なら 0.8 程度）
     state["extraction_confidence"] = 0.95 if not issues else (0.8 if len(issues) == 1 else 0.5)
     print(
-        f"[node] human_review: 入力を反映 material={extracted.get('material')} mass_kg={extracted.get('mass_kg')} issues={issues}"
+        "[node] human_review: 入力を反映 "
+        f"material={extracted.get('material')} "
+        f"mass_kg={extracted.get('mass_kg')} "
+        f"issues={issues}"
     )
     return state
 

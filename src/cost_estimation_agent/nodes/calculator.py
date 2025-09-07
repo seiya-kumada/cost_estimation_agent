@@ -43,6 +43,20 @@ def _calc_material_cost_and_errors(
 
 
 def calculator_node(state: EstimationState) -> EstimationState:
+    """材料コストを計算して状態へ反映するノード。
+
+    振る舞い:
+    - `extracted` から材料(material)と質量(mass_kg)を取得し、材料DBで単価(JPY/kg)を参照。
+    - 計算できれば材料コストと内訳(`cost_breakdown`)を作成し、`total_cost` を設定。
+    - 不足/未登録があれば `errors` に追記し、`total_cost` は `None` とする。
+    - トレースに "calculator" を追加。
+
+    Args:
+    - state: エージェントの状態（抽出結果・エラー・内訳などを含む）。
+
+    Returns:
+    - EstimationState: 計算結果を反映した状態。`errors`/`cost_breakdown`/`total_cost` が更新される。
+    """
     # 履歴を残す。
     record_node_trace(state, "calculator")
 
@@ -77,7 +91,11 @@ def calculator_node(state: EstimationState) -> EstimationState:
 
     if total_cost is not None:
         print(
-            f"[node] calculator: material={breakdown['material_pricing']['material']} unit={unit_price} mass={mass_kg} total={total_cost}"
+            "[node] calculator: "
+            f"material={breakdown['material_pricing']['material']} "
+            f"unit={unit_price} "
+            f"mass={mass_kg} "
+            f"total={total_cost}"
         )
     else:
         print(f"[node] calculator: 見積不能（不足/未登録）。errors={errors}")

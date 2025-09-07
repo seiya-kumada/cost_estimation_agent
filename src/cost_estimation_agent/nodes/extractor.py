@@ -4,6 +4,20 @@ from ._utils import record_node_trace
 
 
 def extractor_node(state: EstimationState) -> EstimationState:
+    """図面から材料と質量(kg)を抽出し、状態へ反映するノード。
+
+    振る舞い:
+    - `input_doc`（画像バイト列または画像パス）を入力に GPT-4o で material/mass_kg を抽出
+    - `extracted` に material・mass_kg・llm_raw を格納
+    - 未取得項目を `extraction_issues` に記録し、`extraction_confidence` を設定（高/中/低）
+    - トレースに "extractor" を追加
+
+    Args:
+    - state: エージェントの状態。
+
+    Returns:
+    - EstimationState: 抽出結果・信頼度・issues を反映した状態。
+    """
     # 抽出情報を格納する準備
     extracted = dict(state.get("extracted") or {})
     issues = []
@@ -48,7 +62,11 @@ def extractor_node(state: EstimationState) -> EstimationState:
     state["extraction_confidence"] = conf
     state["extraction_issues"] = issues
     print(
-        f"[node] extractor: material={extracted.get('material')} mass_kg={extracted.get('mass_kg')} conf={conf:.2f} issues={issues}"
+        "[node] extractor: "
+        f"material={extracted.get('material')} "
+        f"mass_kg={extracted.get('mass_kg')} "
+        f"conf={conf:.2f} "
+        f"issues={issues}"
     )
     return state
 
