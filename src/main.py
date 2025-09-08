@@ -1,8 +1,10 @@
-from dotenv import load_dotenv
-from cost_estimation_agent.graph import compile_app
-from cost_estimation_agent.state import EstimationState
 import argparse
 import os
+
+from dotenv import load_dotenv
+
+from cost_estimation_agent.graph import compile_app
+from cost_estimation_agent.state import EstimationState
 
 
 def main() -> None:
@@ -35,7 +37,7 @@ def main() -> None:
         "meta": {"rfq_id": args.rfq_id, "input_type": "2D-image"},
     }
 
-    # 1回分の推論（疑似）
+    # ワークフローを実行
     result_state = app.invoke(
         initial_state,
         config={"configurable": {"thread_id": "rfq-001"}},

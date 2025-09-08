@@ -3,7 +3,6 @@
 Minimal LLM connection:
 - Azure OpenAI を優先して使用（`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`,
   `AZURE_OPENAI_DEPLOYMENT`, 任意で `AZURE_OPENAI_API_VERSION`）。
-- 未設定/失敗時はフォールバックの定型質問を返します。
 
 本ファイルでは以下を提供します:
 - GPT-4o を用いた図面画像からの材料・質量抽出（Structured Output）
@@ -11,9 +10,8 @@ Minimal LLM connection:
 """
 
 import base64
-import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from pydantic import BaseModel
 
@@ -22,120 +20,89 @@ Note: .env の読み込みはエントリポイント（src/main.py）で行い�
 このモジュールでは環境変数は直接参照します。
 """
 
+
 # Materials helpers moved to adapters/materials.py
-
-
-
-
-
-
-
-
-
-def ocr_layout_tool(doc): ...
-
-
-def symbols_gdt_tool(page_images): ...
-
-
-def geometry_feature_tool(vec_or_mesh): ...
-
-
 def materials_db_query(name: str | None) -> Dict[str, Any]:
-    """Delegates to adapters.materials.materials_db_query."""
+    """材料名から材料単価情報を取得するファサード関数。
+
+    説明:
+    - 実体は `adapters.materials.materials_db_query` に委譲します（疎結合・差し替え容易化）。
+    - 呼び出し側は tools を経由することで、内部実装の変更影響を最小化できます。
+
+    Args:
+    - name: 材料名（例: "SUS304", "A5052"）。未指定/空は未検出扱い。
+
+    Returns:
+    - Dict[str, Any]: 以下のキーを含む辞書。
+        - "found": bool — 見つかったか
+        - "name": str | None — DB上の正規化名
+        - "unit_price_kg": float | None — 単価(JPY/kg)
+        - "source": str — 取得元（例: "file"）
+    """
     from .adapters.materials import materials_db_query as _impl
+
     return _impl(name)
 
 
-def processes_pricing_db_query(req): ...
+def store_history(payload):
+    """見積結果の提示ペイロードを保存するためのフック関数（スタブ）。
 
+    説明:
+    - 現状は実装されていません（no-op）。永続化の要件に応じて具体化してください。
+    - 例: ローカルJSONへの追記、SQLite/外部DBへのINSERT、イベントログ送信など。
 
-def machines_db_query(req): ...
+    Args:
+    - payload: `presentation_node` が生成する提示用ペイロード（辞書）。
+        典型的には次のキーを含みます:
+        - "summary": {"message": str, "total_cost": float|None}
+        - "material_pricing": {"material": str|None, "unit_price_kg": float|None, "mass_kg": float|None}
+        - "errors": list[str]
 
-
-def llm_generate_questions(missing_items: List[str]) -> List[str]:
-    """HITL向けの確認質問を生成します（Azure OpenAI優先、なければフォールバック）。"""
-
-    # Fallback first (works offline)
-    def _fallback(items: List[str]) -> List[str]:
-        if not items:
-            return [
-                "図面の材質（例: SUS304, A5052 等）を指定してください。",
-                "表面粗さや公差の規定で特記事項はありますか？",
-                "数量と希望納期を教えてください。",
-            ]
-        return [f"次の不足項目について具体値を教えてください: {it}" for it in items]
-
-    # Azure OpenAI
-    az_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    az_key = os.getenv("AZURE_OPENAI_API_KEY")
-    az_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-    az_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-
-    if az_endpoint and az_key and az_deployment:
-        try:
-            # Prefer the AzureOpenAI client for Azure endpoints
-            from openai import AzureOpenAI  # type: ignore
-
-            client = AzureOpenAI(
-                api_key=az_key,
-                api_version=az_api_version,
-                azure_endpoint=az_endpoint,
-            )
-
-            items_str = ", ".join(missing_items) if missing_items else "(未指定)"
-            sys = (
-                "You are a manufacturing cost estimation assistant. Given missing "
-                "spec items from a 2D drawing, ask concise Japanese questions to "
-                "clarify only what's necessary for estimation. Respond as a JSON "
-                "array of strings with 3-6 items, no extra text."
-            )
-            usr = "不足項目: " + items_str + "\n" "注意: 各質問は1文、具体的・重複なし、単位明記を促すこと。"
-            resp = client.chat.completions.create(
-                model=az_deployment,
-                messages=[
-                    {"role": "system", "content": sys},
-                    {"role": "user", "content": usr},
-                ],
-                temperature=0.2,
-                max_tokens=300,
-            )
-            content = resp.choices[0].message.content if resp.choices else "[]"
-            try:
-                data = json.loads(content)
-                if isinstance(data, list) and all(isinstance(x, str) for x in data):
-                    print("[tools] llm_generate_questions: Azure OpenAI(JSON) を使用")
-                    return data
-            except Exception:
-                pass
-            lines = [ln.strip("- •* \t") for ln in (content or "").splitlines() if ln.strip()]
-            if lines:
-                print("[tools] llm_generate_questions: Azure OpenAI(行分割) を使用")
-                return lines
-        except Exception as e:
-            print(f"[tools] Azure OpenAI利用に失敗: {e}. Fallbackに切替")
-
-    # Final fallback
-    qs = _fallback(missing_items or [])
-    print("[tools] llm_generate_questions: Fallbackを使用")
-    return qs
-
-
-def store_history(payload): ...
+    Returns:
+    - None
+    """
+    # ここで永続化処理を実装してください（例: ファイル/DB/外部API）。
+    return None
 
 
 # ===== GPT-4o: Structured Output for material & mass =====
 
 
 class MaterialMassOutput(BaseModel):
+    """GPT-4o 抽出結果の構造化スキーマ（Pydanticモデル）。
+
+    目的:
+    - `gpt4o_extract_material_mass` で使用する応答スキーマを定義します。
+    - モデルの Structured Output 機能で、この型に沿った値の生成を促します。
+
+    Attributes:
+    - material: 抽出された材料名（例: "SUS304"）。不明な場合は `None`。
+    - mass_kg: 抽出・換算済みの質量[kg]。不明な場合は `None`。
+    """
+
     material: Optional[str] = None
     mass_kg: Optional[float] = None
 
 
 def _to_image_data_url(doc: bytes | str, detail: str = "high") -> Dict[str, Any]:
-    """Convert image content to OpenAI image_url content block.
+    """OpenAIの"image_url"コンテンツブロックに変換するヘルパー。
 
-    Accepts a path (str) to an image file or raw bytes. PDFは対象外。
+    説明:
+    - 入力がファイルパス（str）の場合はバイナリを読み取り、拡張子からMIMEを推定します。
+    - 入力がバイト列（bytes）の場合はJPEG相当として扱います。
+    - 出力は data URL を含む `{"type": "image_url", "image_url": {"url": ..., "detail": ...}}` 形式。
+    - PDFは非対応です（エラー送出）。
+
+    Args:
+    - doc: 画像のファイルパス（str）または画像の生バイト列（bytes）。
+    - detail: OpenAIの画像詳細レベル（例: "high"）。
+
+    Returns:
+    - Dict[str, Any]: OpenAI Chat API（vision）で使用できる image_url ブロック。
+
+    Raises:
+    - ValueError: PDFファイルが指定された場合。
+    - OSError / IOError: パス指定時のファイル読み込みに失敗した場合。
     """
     if isinstance(doc, str):
         with open(doc, "rb") as f:
@@ -160,12 +127,33 @@ def _to_image_data_url(doc: bytes | str, detail: str = "high") -> Dict[str, Any]
 
 
 def gpt4o_extract_material_mass(doc: bytes | str) -> Dict[str, Any]:
-    """Use Azure OpenAI GPT-4o to extract material and mass(kg) from an image.
+    """図面画像から「材料名」と「質量(kg)」を抽出する（GPT-4o, Structured Output）。
 
-    Returns dict with keys: material, mass_kg, raw
-    - material: str | None
-    - mass_kg: float | None
-    - raw: underlying parsed model as JSON-like dict (or None)
+    説明:
+    - 入力の画像（バイト列またはファイルパス）を data URL 化し、Azure OpenAI GPT-4o に提示。
+    - Pydantic モデル `MaterialMassOutput` を `response_format` として指定し、構造化出力で
+      `material` と `mass_kg` を安全にパースします。
+    - Azure の接続情報が未設定の場合や失敗時は、両項目とも `None` を返します（ログ出力あり）。
+
+    必要な環境変数:
+    - `AZURE_OPENAI_ENDPOINT`: Azure OpenAI エンドポイント URL
+    - `AZURE_OPENAI_API_KEY`: API キー
+    - `AZURE_OPENAI_DEPLOYMENT`: デプロイ名（モデル指定）
+    - `AZURE_OPENAI_API_VERSION`（任意, 既定: "2024-02-15-preview"）
+    - `AZURE_OPENAI_DETAIL`（任意, 既定: "high"）
+
+    Args:
+    - doc: 画像のバイト列（bytes）またはファイルパス（str）。PDF は非対応。
+
+    Returns:
+    - Dict[str, Any]: 以下のキーを含む辞書。
+        - "material": str | None — 抽出された材料名（例: "SUS304"）
+        - "mass_kg": float | None — 抽出・換算済みの質量[kg]
+        - "raw": dict | None — モデルの構造化応答を JSON 風辞書で保持
+
+    Notes:
+    - 内部で例外は捕捉し、`{"material": None, "mass_kg": None, "raw": None}` を返却します。
+    - 入力がファイルパスの場合の読み込みや PDF 指定は `_to_image_data_url` に委譲します。
     """
     az_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     az_key = os.getenv("AZURE_OPENAI_API_KEY")
@@ -178,7 +166,7 @@ def gpt4o_extract_material_mass(doc: bytes | str) -> Dict[str, Any]:
         return {"material": None, "mass_kg": None, "raw": None}
 
     try:
-        from openai import AzureOpenAI  # type: ignore
+        from openai import AzureOpenAI
 
         client = AzureOpenAI(
             api_key=az_key,
@@ -201,7 +189,7 @@ def gpt4o_extract_material_mass(doc: bytes | str) -> Dict[str, Any]:
             model=az_deployment,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": [{"type": "text", "text": user_text}, image_block]},
+                {"role": "user", "content": [{"type": "text", "text": user_text}, image_block]},  # type: ignore
             ],
             temperature=0,
             max_tokens=200,
@@ -224,13 +212,7 @@ def gpt4o_extract_material_mass(doc: bytes | str) -> Dict[str, Any]:
 
 
 __all__ = [
-    "ocr_layout_tool",
-    "symbols_gdt_tool",
-    "geometry_feature_tool",
     "materials_db_query",
-    "processes_pricing_db_query",
-    "machines_db_query",
-    "llm_generate_questions",
     "store_history",
     "gpt4o_extract_material_mass",
 ]
