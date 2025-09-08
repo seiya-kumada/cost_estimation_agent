@@ -10,7 +10,11 @@ Minimal LLM connection:
 """
 
 import base64
+import json
 import os
+import time
+import urllib.error
+import urllib.request
 from typing import Any, Dict, Optional
 
 from pydantic import BaseModel
@@ -65,9 +69,6 @@ def store_history(payload):
     return None
 
 
-# ===== GPT-4o: Structured Output for material & mass =====
-
-
 class MaterialMassOutput(BaseModel):
     """GPT-4o 抽出結果の構造化スキーマ（Pydanticモデル）。
 
@@ -82,6 +83,9 @@ class MaterialMassOutput(BaseModel):
 
     material: Optional[str] = None
     mass_kg: Optional[float] = None
+    # Optional evidence snippets (short text from the drawing/OCR supporting each value)
+    material_evidence: Optional[str] = None
+    mass_kg_evidence: Optional[str] = None
 
 
 def _to_image_data_url(doc: bytes | str, detail: str = "high") -> Dict[str, Any]:
@@ -126,89 +130,361 @@ def _to_image_data_url(doc: bytes | str, detail: str = "high") -> Dict[str, Any]
     }
 
 
+OCR_READ_VERSION = "v3.2"
+OCR_POLL_INTERVAL_S = 0.5
+OCR_POLL_MAX_TRIES = 20
+
+
+def _azure_cv_credentials() -> Optional[tuple[str, str]]:
+    """環境変数から Azure CV の資格情報を取得する。揃っていなければ None。"""
+    endpoint = os.getenv("AZURE_CV_ENDPOINT")
+    key = os.getenv("AZURE_CV_KEY")
+    if not (endpoint and key):
+        return None
+    return endpoint, key
+
+
+def _load_image_bytes(doc: bytes | str) -> Optional[bytes]:
+    """パス/バイト列から画像バイトを取得する。失敗時は None。"""
+    if isinstance(doc, str):
+        try:
+            with open(doc, "rb") as f:
+                return f.read()
+        except Exception as e:
+            print(f"[tools] Azure OCR: 画像読込失敗: {e}")
+            return None
+    return doc
+
+
+def _azure_cv_start_analyze(endpoint: str, key: str, payload: bytes) -> Optional[str]:
+    """Read Analyze を開始し、Operation-Location を返す。失敗時 None。"""
+    analyze_url = endpoint.rstrip("/") + f"/vision/{OCR_READ_VERSION}/read/analyze"
+    req = urllib.request.Request(analyze_url, method="POST")
+    req.add_header("Ocp-Apim-Subscription-Key", key)
+    req.add_header("Content-Type", "application/octet-stream")
+    try:
+        with urllib.request.urlopen(req, data=payload, timeout=15) as resp:
+            return resp.headers.get("Operation-Location")
+    except urllib.error.HTTPError as e:
+        print(f"[tools] Azure OCR analyze失敗: {e}")
+        return None
+    except Exception as e:
+        print(f"[tools] Azure OCR analyze接続失敗: {e}")
+        return None
+
+
+def _azure_cv_poll_result(op_url: str, key: str, interval_s: float, max_tries: int) -> Optional[dict]:
+    """Operation-Location をポーリングし、成功時は結果JSONを返す。失敗/timeoutは None。"""
+    try:
+        for _ in range(max_tries):
+            time.sleep(interval_s)
+            r = urllib.request.Request(op_url, method="GET")
+            r.add_header("Ocp-Apim-Subscription-Key", key)
+            with urllib.request.urlopen(r, timeout=15) as resp2:
+                data = resp2.read()
+            j = json.loads(data.decode("utf-8", errors="ignore"))
+            status = str(j.get("status") or "").lower()
+            if status == "succeeded":
+                return j
+            if status == "failed":
+                print("[tools] Azure OCR: ステータス failed")
+                return None
+        print("[tools] Azure OCR: タイムアウト")
+        return None
+    except Exception as e:
+        print(f"[tools] Azure OCR結果取得失敗: {e}")
+        return None
+
+
+def _extract_ocr_lines(payload: dict) -> list[str]:
+    """Read結果JSONから行テキストを抽出して返す。"""
+    lines: list[str] = []
+    ar = payload.get("analyzeResult") or {}
+    for page in ar.get("readResults", []) or []:
+        for ln in page.get("lines", []) or []:
+            t = str(ln.get("text") or "").strip()
+            if t:
+                lines.append(t)
+    return lines
+
+
+def _normalize_ocr_text(lines: list[str]) -> str:
+    """改行・空行を整えたOCRテキストを返す。"""
+    raw = "\n".join(lines).strip()
+    return "\n".join(s for s in (ln.strip() for ln in raw.splitlines()) if s)
+
+
+def _azure_ocr_extract_text(doc: bytes | str) -> Optional[str]:
+    """Azure Computer Vision Read APIでOCRテキストを抽出する（REST）。"""
+    full = _azure_ocr_extract_full(doc)
+    return (full or {}).get("text") if full else None
+
+
+def _azure_ocr_extract_full(doc: bytes | str) -> Optional[Dict[str, Any]]:
+    """OCRの全文テキストに加えて、各行のバウンディングボックスも返す。"""
+    creds = _azure_cv_credentials()
+    if not creds:
+        print("[tools] Azure OCR 未設定（AZURE_CV_ENDPOINT/AZURE_CV_KEY）")
+        return None
+    endpoint, key = creds
+
+    payload = _load_image_bytes(doc)
+    if payload is None:
+        return None
+
+    op_loc = _azure_cv_start_analyze(endpoint, key, payload)
+    if not op_loc:
+        print("[tools] Azure OCR: Operation-Location 欠如")
+        return None
+
+    result = _azure_cv_poll_result(op_loc, key, OCR_POLL_INTERVAL_S, OCR_POLL_MAX_TRIES)
+    if not result:
+        return None
+
+    # 文字列本文
+    lines_only = _extract_ocr_lines(result)
+    text = _normalize_ocr_text(lines_only)
+
+    # ライン+座標
+    ocr_lines: list[Dict[str, Any]] = []
+    ar = result.get("analyzeResult") or {}
+    for page in ar.get("readResults", []) or []:
+        pw = page.get("width")
+        ph = page.get("height")
+        for ln in page.get("lines", []) or []:
+            ocr_lines.append(
+                {
+                    "text": ln.get("text"),
+                    "bbox": ln.get("boundingBox"),  # [x1,y1,...,x4,y4]
+                    "page_width": pw,
+                    "page_height": ph,
+                }
+            )
+
+    if text:
+        print("[tools] Azure OCR: 抽出成功")
+        return {"text": text, "lines": ocr_lines}
+    return None
+
+
 def gpt4o_extract_material_mass(doc: bytes | str) -> Dict[str, Any]:
     """図面画像から「材料名」と「質量(kg)」を抽出する（GPT-4o, Structured Output）。
 
-    説明:
-    - 入力の画像（バイト列またはファイルパス）を data URL 化し、Azure OpenAI GPT-4o に提示。
-    - Pydantic モデル `MaterialMassOutput` を `response_format` として指定し、構造化出力で
-      `material` と `mass_kg` を安全にパースします。
-    - Azure の接続情報が未設定の場合や失敗時は、両項目とも `None` を返します（ログ出力あり）。
-
-    必要な環境変数:
-    - `AZURE_OPENAI_ENDPOINT`: Azure OpenAI エンドポイント URL
-    - `AZURE_OPENAI_API_KEY`: API キー
-    - `AZURE_OPENAI_DEPLOYMENT`: デプロイ名（モデル指定）
-    - `AZURE_OPENAI_API_VERSION`（任意, 既定: "2024-02-15-preview"）
-    - `AZURE_OPENAI_DETAIL`（任意, 既定: "high"）
-
-    Args:
-    - doc: 画像のバイト列（bytes）またはファイルパス（str）。PDF は非対応。
-
-    Returns:
-    - Dict[str, Any]: 以下のキーを含む辞書。
-        - "material": str | None — 抽出された材料名（例: "SUS304"）
-        - "mass_kg": float | None — 抽出・換算済みの質量[kg]
-        - "raw": dict | None — モデルの構造化応答を JSON 風辞書で保持
-
-    Notes:
-    - 内部で例外は捕捉し、`{"material": None, "mass_kg": None, "raw": None}` を返却します。
-    - 入力がファイルパスの場合の読み込みや PDF 指定は `_to_image_data_url` に委譲します。
+    画像のみの1st passで不足がある場合、OCR（Azure）を併用した2nd passを試行します。
     """
+    client, az_deployment, az_detail = _get_azure_openai_client()
+    if client is None:
+        return {"material": None, "mass_kg": None, "raw": None}
+
+    try:
+        image_block = _to_image_data_url(doc, detail=az_detail)  # may raise if file I/O fails
+        system = _build_system_prompt()
+        user_text = _build_base_user_prompt()
+
+        # 1st pass: image only
+        parts1 = _build_user_parts(user_text=user_text, image_block=image_block)
+        parsed1 = _chat_parse_material_mass(client, az_deployment, system, parts1)
+        if _is_complete(parsed1):
+            print("[tools] gpt4o_extract_material_mass: Structured Output (image only)")
+            _log_evidence(parsed1)
+            # 1st pass 成功時も、可能ならOCRの座標から大まかな位置を推定して表示
+            if _ocr_assist_enabled():
+                ocr_full_1st = _azure_ocr_extract_full(doc)
+                if ocr_full_1st and ocr_full_1st.get("lines"):
+                    _log_locations_from_ocr(parsed1, ocr_full_1st["lines"])
+            return _to_result(parsed1)
+
+        # 2nd pass: GPT-4o with OCR-assisted text (Azure OCR as source)
+        if _ocr_assist_enabled():
+            _log_2nd_pass_reasons(parsed1)
+            ocr_full = _azure_ocr_extract_full(doc)
+            if ocr_full and ocr_full.get("text"):
+                parts2 = _build_user_parts_with_ocr(
+                    user_text=user_text, image_block=image_block, ocr_text=ocr_full["text"]
+                )
+                parsed2 = _chat_parse_material_mass(client, az_deployment, system, parts2)
+                if parsed2:
+                    print("[tools] gpt4o_extract_material_mass: Structured Output (with OCR)")
+                    _log_evidence(parsed2)
+                    # 位置推定（OCR行の座標から大まかな方位を推測）
+                    _log_locations_from_ocr(parsed2, ocr_full.get("lines") or [])
+                    return _to_result(parsed2)
+            else:
+                print("[tools] gpt4o_extract_material_mass: 2nd pass skipped (no OCR text)")
+
+        print("[tools] gpt4o_extract_material_mass: 応答なし/不完全")
+        return {"material": None, "mass_kg": None, "raw": None}
+    except Exception as e:
+        print(f"[tools] GPT-4o抽出に失敗: {e}")
+        return {"material": None, "mass_kg": None, "raw": None}
+
+
+# ===== Internal helpers for GPT-4o extraction =====
+def _get_azure_openai_client():
     az_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     az_key = os.getenv("AZURE_OPENAI_API_KEY")
     az_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
     az_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
     az_detail = os.getenv("AZURE_OPENAI_DETAIL", "high")
-
     if not (az_endpoint and az_key and az_deployment):
         print("[tools] GPT-4o設定不足。material/mass_kgはNoneで返却")
-        return {"material": None, "mass_kg": None, "raw": None}
+        return None, None, None
+    from openai import AzureOpenAI  # type: ignore
 
+    client = AzureOpenAI(api_key=az_key, api_version=az_api_version, azure_endpoint=az_endpoint)
+    return client, az_deployment, az_detail
+
+
+def _build_system_prompt() -> str:
+    return (
+        "You are an assistant that extracts only 'material' and 'mass_kg' "
+        "from a mechanical drawing image. Return structured output using the provided schema."
+    )
+
+
+def _build_base_user_prompt() -> str:
+    return (
+        "日本語で記載された機械図面画像から、材料名（例: SUS304, A5052, SS400 等）と質量(kg)のみを読み取り、"
+        "次のスキーマ（material: string|null, mass_kg: number|null）に従って返してください。"
+        "単位がkg以外ならkgへ変換し、小数3桁程度に丸めてください。"
+        "可能であれば、各項目を裏付ける短いテキスト断片をそれぞれ"
+        "material_evidence と mass_kg_evidence に含めてください（最大50文字程度）。"
+    )
+
+
+def _build_user_parts(*, user_text: str, image_block: Dict[str, Any]) -> list[dict[str, Any]]:
+    return [{"type": "text", "text": user_text}, image_block]
+
+
+def _build_user_parts_with_ocr(*, user_text: str, image_block: Dict[str, Any], ocr_text: str) -> list[dict[str, Any]]:
+    max_chars = int(os.getenv("MAX_OCR_CHARS", "4000"))
+    snippet = ocr_text[:max_chars]
+    assist = (
+        "以下はOCRで抽出した文字列です（誤りを含む可能性があります）。必要に応じて参照し、"
+        "材料名と質量(kg)のみをスキーマに従って返してください。\nOCR transcript:\n" + snippet
+    )
+    return [
+        {"type": "text", "text": user_text},
+        {"type": "text", "text": assist},
+        image_block,
+    ]
+
+
+def _chat_parse_material_mass(client, model: str, system: str, parts: list[dict[str, Any]]):
+    resp = client.beta.chat.completions.parse(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": parts},  # type: ignore[arg-type]
+        ],
+        temperature=0,
+        max_tokens=200,
+        response_format=MaterialMassOutput,
+    )
+    return resp.choices[0].message.parsed if resp.choices else None
+
+
+def _is_complete(parsed) -> bool:
+    return bool(parsed and (parsed.material is not None) and (parsed.mass_kg is not None))
+
+
+def _to_result(parsed) -> Dict[str, Any]:
+    return {
+        "material": parsed.material,
+        "mass_kg": parsed.mass_kg,
+        "raw": parsed.model_dump(mode="json"),
+        "evidence": {
+            "material_evidence": getattr(parsed, "material_evidence", None),
+            "mass_kg_evidence": getattr(parsed, "mass_kg_evidence", None),
+        },
+    }
+
+
+def _ocr_assist_enabled() -> bool:
+    return os.getenv("OCR_ASSIST", "false").lower() in ("1", "true", "yes", "on")
+
+
+def _log_2nd_pass_reasons(parsed) -> None:
+    reasons: list[str] = []
+    if not parsed:
+        reasons.append("no structured response")
+    else:
+        if parsed.material is None:
+            reasons.append("material missing")
+        if parsed.mass_kg is None:
+            reasons.append("mass_kg missing")
+    print(f"[tools] gpt4o_extract_material_mass: 2nd pass (OCR) trigger reasons: {', '.join(reasons) or 'unknown'}")
+
+
+def _log_evidence(parsed) -> None:
     try:
-        from openai import AzureOpenAI
+        me = getattr(parsed, "material_evidence", None)
+        ke = getattr(parsed, "mass_kg_evidence", None)
+        if me or ke:
+            print("[tools] evidence: material <- " + (me or "(none)"))
+            print("[tools] evidence: mass_kg <- " + (ke or "(none)"))
+    except Exception:
+        pass
 
-        client = AzureOpenAI(
-            api_key=az_key,
-            api_version=az_api_version,
-            azure_endpoint=az_endpoint,
-        )
 
-        image_block = _to_image_data_url(doc, detail=az_detail)
-        system = (
-            "You are an assistant that extracts only 'material' and 'mass_kg' "
-            "from a mechanical drawing image. Return structured output using the provided schema."
-        )
-        user_text = (
-            "日本語で記載された機械図面画像から、材料名（例: SUS304, A5052, SS400 等）と質量(kg)のみを読み取り、"
-            "次のスキーマ（material: string|null, mass_kg: number|null）に従って返してください。"
-            "単位がkg以外ならkgへ変換し、小数3桁程度に丸めてください。余計な説明や補足は不要です。"
-        )
+def _log_locations_from_ocr(parsed, ocr_lines: list[Dict[str, Any]]) -> None:
+    try:
+        me = getattr(parsed, "material_evidence", None)
+        ke = getattr(parsed, "mass_kg_evidence", None)
+        if me:
+            desc = _locate_evidence_in_ocr(me, ocr_lines)
+            if desc:
+                print(f"[tools] location: material ≈ {desc}")
+        if ke:
+            desc = _locate_evidence_in_ocr(ke, ocr_lines)
+            if desc:
+                print(f"[tools] location: mass_kg ≈ {desc}")
+    except Exception:
+        pass
 
-        resp = client.beta.chat.completions.parse(
-            model=az_deployment,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": [{"type": "text", "text": user_text}, image_block]},  # type: ignore
-            ],
-            temperature=0,
-            max_tokens=200,
-            response_format=MaterialMassOutput,
-        )
 
-        parsed = resp.choices[0].message.parsed if resp.choices else None
-        if parsed:
-            print("[tools] gpt4o_extract_material_mass: Structured Output を使用")
-            return {
-                "material": parsed.material,
-                "mass_kg": parsed.mass_kg,
-                "raw": parsed.model_dump(mode="json"),
-            }
-        print("[tools] gpt4o_extract_material_mass: 応答なし")
-        return {"material": None, "mass_kg": None, "raw": None}
-    except Exception as e:
-        print(f"[tools] GPT-4o抽出に失敗: {e}")
-        return {"material": None, "mass_kg": None, "raw": None}
+def _locate_evidence_in_ocr(evidence: str, ocr_lines: list[Dict[str, Any]]) -> Optional[str]:
+    if not evidence:
+        return None
+    ev = str(evidence).strip().lower()
+    best = None
+    best_score = 0
+    # 単純な一致/トークン重なりでベスト行を探索
+    ev_tokens = [t for t in ev.replace("kg", " kg ").split() if t]
+    for ln in ocr_lines:
+        text = str(ln.get("text") or "").lower()
+        score = 0
+        if ev in text:
+            score = len(ev)
+        else:
+            ln_tokens = [t for t in text.replace("kg", " kg ").split() if t]
+            overlap = len(set(ev_tokens) & set(ln_tokens))
+            score = overlap
+        if score > best_score:
+            best_score = score
+            best = ln
+    if not best or not best.get("bbox"):
+        return None
+    bbox = best["bbox"] or []
+    pw = best.get("page_width") or 1
+    ph = best.get("page_height") or 1
+    try:
+        xs = [bbox[i] for i in range(0, len(bbox), 2)]
+        ys = [bbox[i] for i in range(1, len(bbox), 2)]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        rx = min(max(cx / pw, 0.0), 1.0)
+        ry = min(max(cy / ph, 0.0), 1.0)
+        # 方位の粗い分類
+        horiz = "左" if rx < 0.33 else ("中央" if rx < 0.66 else "右")
+        vert = "上" if ry < 0.33 else ("中央" if ry < 0.66 else "下")
+        if horiz == "中央" and vert == "中央":
+            pos = "中央付近"
+        else:
+            pos = f"{horiz}{vert}"
+        return f"{pos}（~{int(rx*100)}%, ~{int(ry*100)}%） " f"center=({int(cx)},{int(cy)})px bbox={bbox}"
+    except Exception:
+        return None
 
 
 __all__ = [
