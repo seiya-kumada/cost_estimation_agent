@@ -391,7 +391,7 @@ def gpt4o_extract_material_mass(doc: bytes | str) -> Dict[str, Any]:
             user_text=user_text,
             image_block=image_block,
         )
-        if _is_complete(parsed1):
+        if _is_complete(parsed1) and parsed1 is not None:
             print("[tools] gpt4o_extract_material_mass: Structured Output (image only)")
             _log_evidence(parsed1)
             # 1st pass 成功時も、可能ならOCRの座標から大まかな位置を推定して表示
@@ -461,6 +461,14 @@ def _get_azure_openai_client() -> Optional[tuple[Any, str, str]]:
 
 
 def _build_system_prompt() -> str:
+    """LLM 用のシステムプロンプトを構築して返す。
+
+    図面画像から抽出すべき項目（material, mass_kg）を明示し、
+    返却形式が構造化出力であることを指示する短い定常文です。
+
+    Returns:
+        str: システムロールに渡す英語のプロンプト文字列。
+    """
     return (
         "You are an assistant that extracts only 'material' and 'mass_kg' "
         "from a mechanical drawing image. Return structured output using the provided schema."
@@ -468,6 +476,15 @@ def _build_system_prompt() -> str:
 
 
 def _build_base_user_prompt() -> str:
+    """ユーザープロンプト（日本語）の定型文を構築して返す。
+
+    図面画像から抽出すべき項目（材料名と質量[kg]）、出力スキーマ、単位換算、
+    可能であれば根拠テキスト(evidence)も含める旨を日本語で明示します。
+    OCR 併用時は `_build_user_parts_with_ocr` 側でこの文面にOCR断片が追記されます。
+
+    Returns:
+        str: ユーザー発話として送る日本語プロンプト文字列。
+    """
     return (
         "日本語で記載された機械図面画像から、材料名（例: SUS304, A5052, SS400 等）と質量(kg)のみを読み取り、"
         "次のスキーマ（material: string|null, mass_kg: number|null）に従って返してください。"
@@ -478,10 +495,39 @@ def _build_base_user_prompt() -> str:
 
 
 def _build_user_parts(*, user_text: str, image_block: Dict[str, Any]) -> list[dict[str, Any]]:
+    """Vision入力用のユーザー発話コンテンツを構築する。
+
+    Chat Completions（Vision）に渡す `content` 配列の一部を作り、
+    テキスト指示と画像ブロック（`image_url`）を並べて返します。
+
+    Args:
+        user_text: 日本語の指示文（抽出対象・スキーマなど）。
+        image_block: `_to_image_data_url` が返す `{"type":"image_url", ...}` ブロック。
+
+    Returns:
+        list[dict[str, Any]]: `[{"type":"text", ...}, image_block]` の配列。
+    """
     return [{"type": "text", "text": user_text}, image_block]
 
 
 def _build_user_parts_with_ocr(*, user_text: str, image_block: Dict[str, Any], ocr_text: str) -> list[dict[str, Any]]:
+    """OCRテキストを併用するユーザー発話コンテンツを構築する。
+
+    画像に対する日本語の指示文に加え、OCRで抽出した文字列のスニペットを
+    追加したうえで、Vision入力用の `content` 配列を返します。
+
+    Args:
+        user_text: 日本語の指示文（抽出対象・スキーマなど）。
+        image_block: `_to_image_data_url` が返す `{"type":"image_url", ...}` ブロック。
+        ocr_text: Azure OCR から得た全文テキスト。
+
+    Returns:
+        list[dict[str, Any]]: `[{"type":"text", ...}, {"type":"text", ...}, image_block]` の配列。
+
+    Notes:
+        - `MAX_OCR_CHARS`（既定 4000）で `ocr_text` を先頭から切り詰めて使用します。
+        - OCRは誤りを含む旨を明記し、参照補助としてのみ用いることを促します。
+    """
     max_chars = int(os.getenv("MAX_OCR_CHARS", "4000"))
     snippet = ocr_text[:max_chars]
     assist = (
@@ -498,7 +544,21 @@ def _build_user_parts_with_ocr(*, user_text: str, image_block: Dict[str, Any], o
 def _run_first_pass(
     *, client, model: str, system: str, user_text: str, image_block: Dict[str, Any]
 ) -> Optional[MaterialMassOutput]:
-    """画像のみで Structured Output を得る 1st pass を実行する。"""
+    """画像のみで Structured Output を得る 1st pass を実行する。
+
+    GPT‑4o に対して、システム/ユーザー指示と画像ブロックのみを与え、
+    材料名と質量(kg)の構造化出力を取得します（OCRは併用しません）。
+
+    Args:
+        client: Azure OpenAI のクライアントインスタンス。
+        model: 使用するデプロイメント名。
+        system: システムプロンプト文字列。
+        user_text: ユーザープロンプト文字列。
+        image_block: `_to_image_data_url` が返す `image_url` ブロック。
+
+    Returns:
+        MaterialMassOutput | None: 構造化応答のパース結果。失敗時は `None`。
+    """
     parts = _build_user_parts(user_text=user_text, image_block=image_block)
     return _chat_parse_material_mass(client, model, system, parts)
 
@@ -512,12 +572,49 @@ def _run_second_pass(
     image_block: Dict[str, Any],
     ocr_text: str,
 ) -> Optional[MaterialMassOutput]:
-    """OCR テキストを併用して Structured Output を得る 2nd pass を実行する。"""
+    """OCR テキストを併用して Structured Output を得る 2nd pass を実行する。
+
+    1st pass で十分な情報が得られない場合に、OCR で抽出したテキストを
+    ユーザー発話の補助として追加し、GPT‑4o の構造化応答を取得します。
+
+    Args:
+        client: Azure OpenAI のクライアントインスタンス。
+        model: 使用するデプロイメント名。
+        system: システムプロンプト文字列。
+        user_text: ユーザープロンプト文字列。
+        image_block: `_to_image_data_url` が返す `image_url` ブロック。
+        ocr_text: Azure OCR から得た全文テキスト。
+
+    Returns:
+        MaterialMassOutput | None: 構造化応答のパース結果。失敗時は `None`。
+
+    Notes:
+        - 実際のメッセージ構築は `_build_user_parts_with_ocr` に委譲します。
+        - `MAX_OCR_CHARS` で OCR テキストは先頭から切り詰められます。
+    """
     parts = _build_user_parts_with_ocr(user_text=user_text, image_block=image_block, ocr_text=ocr_text)
     return _chat_parse_material_mass(client, model, system, parts)
 
 
 def _chat_parse_material_mass(client, model: str, system: str, parts: list[dict[str, Any]]):
+    """Chat Completions(parse) を用いて構造化応答を取得する。
+
+    Azure OpenAI の Chat Completions の `parse` 機能を利用し、
+    `MaterialMassOutput`（Pydantic）へ直接パースされた結果を返します。
+
+    Args:
+        client: Azure OpenAI のクライアントインスタンス。
+        model: 使用するデプロイメント名。
+        system: システムプロンプト文字列。
+        parts: ユーザーメッセージの `content` 配列（テキスト/画像/補助テキストなど）。
+
+    Returns:
+        MaterialMassOutput | None: 構造化応答のパース結果。選択肢が空の場合は `None`。
+
+    Notes:
+        - `response_format=MaterialMassOutput`, `temperature=0`, `max_tokens=200` を指定しています。
+        - SDK 側の例外は上位で捕捉してください（本関数では握りません）。
+    """
     resp = client.beta.chat.completions.parse(
         model=model,
         messages=[
@@ -531,11 +628,33 @@ def _chat_parse_material_mass(client, model: str, system: str, parts: list[dict[
     return resp.choices[0].message.parsed if resp.choices else None
 
 
-def _is_complete(parsed) -> bool:
+def _is_complete(parsed: Optional[MaterialMassOutput]) -> bool:
+    """抽出結果が完了要件を満たすかを判定する。
+
+    完了要件は `material` と `mass_kg` の両方が `None` でないこと。
+
+    Args:
+        parsed: 構造化応答のパース結果。`None` の可能性あり。
+
+    Returns:
+        bool: 両フィールドが存在して値を持つ場合に `True`。
+    """
     return bool(parsed and (parsed.material is not None) and (parsed.mass_kg is not None))
 
 
-def _to_result(parsed) -> Dict[str, Any]:
+def _to_result(parsed: MaterialMassOutput) -> Dict[str, Any]:
+    """Pydantic出力を最終的な辞書形式に整形する。
+
+    `MaterialMassOutput`（構造化応答）から、呼び出し側へ返す辞書を生成します。
+    抽出値に加えて、モデルの生データ(`raw`)と可能なら evidence 断片を含めます。
+
+    Args:
+        parsed: 構造化応答のPydanticモデル。完成済みを想定。
+
+    Returns:
+        Dict[str, Any]: `material`, `mass_kg`, `raw`, `evidence` を含む辞書。
+            - `evidence` は `material_evidence`, `mass_kg_evidence` を持ち、存在しない場合は `None`。
+    """
     return {
         "material": parsed.material,
         "mass_kg": parsed.mass_kg,
@@ -548,10 +667,29 @@ def _to_result(parsed) -> Dict[str, Any]:
 
 
 def _ocr_assist_enabled() -> bool:
+    """OCR 併用（2nd pass）を有効にする設定かを判定する。
+
+    環境変数 `OCR_ASSIST` の値が有効トークン（`1`, `true`, `yes`, `on` のいずれか・大文字小文字無視）
+    に一致する場合に `True` を返します。
+
+    Returns:
+        bool: OCR 併用が有効なら `True`、それ以外は `False`。
+    """
     return os.getenv("OCR_ASSIST", "false").lower() in ("1", "true", "yes", "on")
 
 
-def _log_2nd_pass_reasons(parsed) -> None:
+def _log_2nd_pass_reasons(parsed: Optional[MaterialMassOutput]) -> None:
+    """2nd pass（OCR併用）を試みる理由をログ出力する。
+
+    1st pass の構造化応答を確認し、`material`/`mass_kg` の欠落や応答自体の
+    欠如を根拠として、2nd pass のトリガー理由を標準出力へ記録します。
+
+    Args:
+        parsed: 1st pass の構造化応答。`None` の場合は「no structured response」を記録。
+
+    Returns:
+        None
+    """
     reasons: list[str] = []
     if not parsed:
         reasons.append("no structured response")
@@ -563,7 +701,16 @@ def _log_2nd_pass_reasons(parsed) -> None:
     print(f"[tools] gpt4o_extract_material_mass: 2nd pass (OCR) trigger reasons: {', '.join(reasons) or 'unknown'}")
 
 
-def _log_evidence(parsed) -> None:
+def _log_evidence(parsed: MaterialMassOutput) -> None:
+    """抽出結果に含まれる根拠テキストをログ出力する。
+
+    Args:
+        parsed: 構造化応答のPydanticモデル。`material_evidence`／`mass_kg_evidence` を
+            含む可能性がある。
+
+    Returns:
+        None
+    """
     try:
         me = getattr(parsed, "material_evidence", None)
         ke = getattr(parsed, "mass_kg_evidence", None)
@@ -574,7 +721,20 @@ def _log_evidence(parsed) -> None:
         pass
 
 
-def _log_locations_from_ocr(parsed, ocr_lines: list[Dict[str, Any]]) -> None:
+def _log_locations_from_ocr(parsed: MaterialMassOutput, ocr_lines: list[Dict[str, Any]]) -> None:
+    """OCR行座標を用いて evidence のおおよその位置をログ出力する。
+
+    `parsed` に含まれる `material_evidence` / `mass_kg_evidence` を、与えられた
+    `ocr_lines`（各行の `text`, `bbox`, `page_width`, `page_height` を含む辞書のリスト）
+    と照合し、最も合致する行の相対位置（％）や中心px/bboxを推定して出力します。
+
+    Args:
+        parsed: 構造化応答（evidence を含む可能性あり）。
+        ocr_lines: Azure OCR から得た行情報のリスト。
+
+    Returns:
+        None
+    """
     try:
         me = getattr(parsed, "material_evidence", None)
         ke = getattr(parsed, "mass_kg_evidence", None)
@@ -591,6 +751,19 @@ def _log_locations_from_ocr(parsed, ocr_lines: list[Dict[str, Any]]) -> None:
 
 
 def _locate_evidence_in_ocr(evidence: str, ocr_lines: list[Dict[str, Any]]) -> Optional[str]:
+    """OCR行から evidence に最も合致する行を見つけ位置記述を返す。
+
+    単純一致またはトークン重なりによるスコアリングで最適な行を選び、
+    その行の `bbox` とページ幅・高さから相対位置（％）を算出します。返り値は
+    「方位（%）, center=(x,y)px bbox=[...]」形式の短い文字列です。
+
+    Args:
+        evidence: 図面からの根拠テキスト断片。
+        ocr_lines: Azure OCR の行情報のリスト（`text`, `bbox`, `page_width`, `page_height`）。
+
+    Returns:
+        str | None: 推定位置の記述。該当行が見つからない、または座標がない場合は `None`。
+    """
     if not evidence:
         return None
     ev = str(evidence).strip().lower()
@@ -629,7 +802,7 @@ def _locate_evidence_in_ocr(evidence: str, ocr_lines: list[Dict[str, Any]]) -> O
             pos = "中央付近"
         else:
             pos = f"{horiz}{vert}"
-        return f"{pos}（~{int(rx*100)}%, ~{int(ry*100)}%） " f"center=({int(cx)},{int(cy)})px bbox={bbox}"
+        return f"{pos}（~{int(rx * 100)}%, ~{int(ry * 100)}%） " f"center=({int(cx)},{int(cy)})px bbox={bbox}"
     except Exception:
         return None
 
