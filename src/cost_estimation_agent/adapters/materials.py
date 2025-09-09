@@ -21,7 +21,7 @@ def _normalize_material_key(s: str) -> str:
     return unicodedata.normalize("NFKC", s).strip().upper()
 
 
-def _material_prices_file_path() -> str:
+def _get_material_prices_file_path() -> str:
     """材料単価JSONファイルの絶対パスを返します。
 
     説明:
@@ -59,7 +59,7 @@ def _load_material_prices_file() -> Dict[str, Any] | None:
 
     Note: Load material prices mapping from JSON file if it exists.
     """
-    path = _material_prices_file_path()
+    path = _get_material_prices_file_path()
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -95,7 +95,7 @@ def _lookup_in_file_mapping(mapping: Dict[str, Any], target_norm: str) -> Dict[s
     return None
 
 
-def materials_db_query(name: str | None) -> Dict[str, Any]:
+def query_materials_db(name: str | None) -> Dict[str, Any]:
     """材料単価(JPY/kg)をDBから取り出す。
 
     A5052 と A5052-H24 は別物として扱う（同一視しない）。
@@ -116,7 +116,7 @@ def materials_db_query(name: str | None) -> Dict[str, Any]:
         return {"found": False, "name": None, "unit_price_kg": None, "source": "file"}
 
     # ローカルDBを必須化：存在しなければ中断
-    data_path = _material_prices_file_path()
+    data_path = _get_material_prices_file_path()
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Material price DB not found: {data_path}")
 
@@ -139,4 +139,4 @@ def materials_db_query(name: str | None) -> Dict[str, Any]:
     return {"found": False, "name": None, "unit_price_kg": None, "source": "file"}
 
 
-__all__ = ["materials_db_query"]
+__all__ = ["query_materials_db"]

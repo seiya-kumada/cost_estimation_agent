@@ -1,7 +1,7 @@
 from typing import Any, Dict
 
 from ..state import EstimationState
-from ..tools import materials_db_query
+from ..tools import query_materials_db
 from ._utils import record_node_trace
 
 
@@ -69,7 +69,7 @@ def calculator_node(state: EstimationState) -> EstimationState:
     errors = list(state.get("errors", []) or [])
 
     # 材料単価をDBから取得
-    mat_info = materials_db_query(material)
+    mat_info = query_materials_db(material)
     unit_price = mat_info.get("unit_price_kg") if mat_info.get("found") else None
 
     # コスト計算とエラー更新
@@ -113,7 +113,7 @@ def make_cost_breakdown(
     """材料原価に関するブレークダウン(dict)を組み立てる。
 
     引数:
-    - mat_info: `materials_db_query` の結果辞書。
+    - mat_info: `query_materials_db` の結果辞書。
     - extracted_material: 抽出またはHITLで得た材料名（DB未ヒット時のフォールバック表示用）。
     - unit_price: 単価 (JPY/kg)。
     - mass_kg: 質量 (kg)。

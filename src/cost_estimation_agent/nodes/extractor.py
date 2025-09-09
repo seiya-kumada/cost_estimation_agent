@@ -1,5 +1,5 @@
 from ..state import EstimationState
-from ..tools import gpt4o_extract_material_mass
+from ..tools import extract_material_mass_via_gpt4o
 from ._utils import record_node_trace
 
 
@@ -29,7 +29,7 @@ def extractor_node(state: EstimationState) -> EstimationState:
             raise KeyError("input_doc is missing in state")
 
         # 図面から材料と質量を抽出
-        res = gpt4o_extract_material_mass(doc)
+        res = extract_material_mass_via_gpt4o(doc)
         material = res.get("material")
         mass_kg = res.get("mass_kg")
 
