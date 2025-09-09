@@ -1,12 +1,20 @@
-"""External tools and services.
+"""外部ツール/サービスとの連携。
 
-Minimal LLM connection:
-- Azure OpenAI を優先して使用（`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`,
-  `AZURE_OPENAI_DEPLOYMENT`, 任意で `AZURE_OPENAI_API_VERSION`）。
+提供機能:
+- 図面画像からの材料・質量抽出 (GPT‑4o Structured Output): `gpt4o_extract_material_mass(doc)`
+  - `OCR_ASSIST` が有効かつ `AZURE_CV_ENDPOINT`/`AZURE_CV_KEY` が設定されていれば、
+    Azure Computer Vision Read (OCR) と併用した 2nd pass を実行
+  - 抽出値に対応する短い根拠テキストを返し、OCR がある場合はおおよその位置(%)に加えて
+    中心 px / bbox もログ出力
+- 材料単価参照のファサード: `materials_db_query(name)` → `adapters.materials` に委譲
+- 見積履歴保存フック: `store_history(payload)`（現在は no-op）
 
-本ファイルでは以下を提供します:
-- GPT-4o を用いた図面画像からの材料・質量抽出（Structured Output）
-  - `gpt4o_extract_material_mass(doc)`
+LLM 設定:
+- Azure OpenAI を使用（`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`,
+  `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION`）
+
+補足:
+- `.env` の読み込みはエントリポイントで行い、本モジュールは環境変数を直接参照します。
 """
 
 import base64
@@ -19,29 +27,22 @@ from typing import Any, Dict, Optional
 
 from pydantic import BaseModel
 
-"""
-Note: .env の読み込みはエントリポイント（src/main.py）で行います。
-このモジュールでは環境変数は直接参照します。
-"""
 
-
-# Materials helpers moved to adapters/materials.py
 def materials_db_query(name: str | None) -> Dict[str, Any]:
     """材料名から材料単価情報を取得するファサード関数。
 
-    説明:
-    - 実体は `adapters.materials.materials_db_query` に委譲します（疎結合・差し替え容易化）。
-    - 呼び出し側は tools を経由することで、内部実装の変更影響を最小化できます。
+    実体は `adapters.materials.materials_db_query` に委譲します。呼び出し側は tools を
+    経由することで、内部実装変更の影響を最小化できます。
 
     Args:
-    - name: 材料名（例: "SUS304", "A5052"）。未指定/空は未検出扱い。
+        name: 材料名（例: "SUS304", "A5052"）。未指定/空は未検出扱い。
 
     Returns:
-    - Dict[str, Any]: 以下のキーを含む辞書。
-        - "found": bool — 見つかったか
-        - "name": str | None — DB上の正規化名
-        - "unit_price_kg": float | None — 単価(JPY/kg)
-        - "source": str — 取得元（例: "file"）
+        Dict[str, Any]: 次のキーを含む辞書。
+            - "found": bool — 見つかったか
+            - "name": str | None — DB上の正規化名
+            - "unit_price_kg": float | None — 単価(JPY/kg)
+            - "source": str — 取得元（例: "file"）
     """
     from .adapters.materials import materials_db_query as _impl
 
@@ -51,19 +52,15 @@ def materials_db_query(name: str | None) -> Dict[str, Any]:
 def store_history(payload):
     """見積結果の提示ペイロードを保存するためのフック関数（スタブ）。
 
-    説明:
-    - 現状は実装されていません（no-op）。永続化の要件に応じて具体化してください。
-    - 例: ローカルJSONへの追記、SQLite/外部DBへのINSERT、イベントログ送信など。
+    現状は no-op です。永続化要件に応じて、ローカルJSON追記やDB挿入、イベント送信などを
+    実装してください。
 
     Args:
-    - payload: `presentation_node` が生成する提示用ペイロード（辞書）。
-        典型的には次のキーを含みます:
-        - "summary": {"message": str, "total_cost": float|None}
-        - "material_pricing": {"material": str|None, "unit_price_kg": float|None, "mass_kg": float|None}
-        - "errors": list[str]
+        payload: `presentation_node` が生成する提示用ペイロード（辞書）。
+            例: "summary", "material_pricing", "errors" などのキーを含む。
 
     Returns:
-    - None
+        None
     """
     # ここで永続化処理を実装してください（例: ファイル/DB/外部API）。
     return None
@@ -72,13 +69,11 @@ def store_history(payload):
 class MaterialMassOutput(BaseModel):
     """GPT-4o 抽出結果の構造化スキーマ（Pydanticモデル）。
 
-    目的:
-    - `gpt4o_extract_material_mass` で使用する応答スキーマを定義します。
-    - モデルの Structured Output 機能で、この型に沿った値の生成を促します。
+    `gpt4o_extract_material_mass` の Structured Output で使用する応答スキーマです。
 
     Attributes:
-    - material: 抽出された材料名（例: "SUS304"）。不明な場合は `None`。
-    - mass_kg: 抽出・換算済みの質量[kg]。不明な場合は `None`。
+        material: 抽出された材料名（例: "SUS304"）。不明な場合は `None`。
+        mass_kg: 抽出・換算済みの質量[kg]。不明な場合は `None`。
     """
 
     material: Optional[str] = None
@@ -89,24 +84,21 @@ class MaterialMassOutput(BaseModel):
 
 
 def _to_image_data_url(doc: bytes | str, detail: str = "high") -> Dict[str, Any]:
-    """OpenAIの"image_url"コンテンツブロックに変換するヘルパー。
+    """OpenAI の `image_url` コンテンツブロックに変換するヘルパー。
 
-    説明:
-    - 入力がファイルパス（str）の場合はバイナリを読み取り、拡張子からMIMEを推定します。
-    - 入力がバイト列（bytes）の場合はJPEG相当として扱います。
-    - 出力は data URL を含む `{"type": "image_url", "image_url": {"url": ..., "detail": ...}}` 形式。
-    - PDFは非対応です（エラー送出）。
+    入力がパスの場合はファイルを読み込み、拡張子からMIMEを推定します。入力がバイト列の
+    場合は JPEG 相当として扱い、Base64 を含む data URL を生成します。PDF は非対応です。
 
     Args:
-    - doc: 画像のファイルパス（str）または画像の生バイト列（bytes）。
-    - detail: OpenAIの画像詳細レベル（例: "high"）。
+        doc: 画像のファイルパス（str）または画像の生バイト列（bytes）。
+        detail: OpenAI の画像詳細レベル（例: "high"）。
 
     Returns:
-    - Dict[str, Any]: OpenAI Chat API（vision）で使用できる image_url ブロック。
+        Dict[str, Any]: Chat API（Vision）で使用できる `image_url` ブロック。
 
     Raises:
-    - ValueError: PDFファイルが指定された場合。
-    - OSError / IOError: パス指定時のファイル読み込みに失敗した場合。
+        ValueError: PDF ファイルが指定された場合。
+        OSError | IOError: パス指定時のファイル読み込みに失敗した場合。
     """
     if isinstance(doc, str):
         with open(doc, "rb") as f:
@@ -136,7 +128,15 @@ OCR_POLL_MAX_TRIES = 20
 
 
 def _azure_cv_credentials() -> Optional[tuple[str, str]]:
-    """環境変数から Azure CV の資格情報を取得する。揃っていなければ None。"""
+    """`AZURE_CV_ENDPOINT` と `AZURE_CV_KEY` を読み取り、OCR 用資格情報を返す。
+
+    Returns:
+        tuple[str, str] | None: `(endpoint, key)`。いずれか未設定の場合は `None`。
+
+    Notes:
+        - 呼び出し側は `None` を考慮して分岐してください。
+        - 実際の Read API 呼び出しではモジュール定数 `OCR_READ_VERSION`（例: `v3.2`）を使用します。
+    """
     endpoint = os.getenv("AZURE_CV_ENDPOINT")
     key = os.getenv("AZURE_CV_KEY")
     if not (endpoint and key):
@@ -145,7 +145,21 @@ def _azure_cv_credentials() -> Optional[tuple[str, str]]:
 
 
 def _load_image_bytes(doc: bytes | str) -> Optional[bytes]:
-    """パス/バイト列から画像バイトを取得する。失敗時は None。"""
+    """パス/バイト列から画像データ（bytes）を取得するユーティリティ。
+
+    引数がファイルパスの場合は `rb` で読み込み、引数がバイト列の場合はそのまま返します。
+    読み込み失敗時は `None` を返し、パス指定時は簡易ログを出力します。
+
+    Args:
+        doc: 画像ファイルのパス（str）または画像バイト（bytes）。
+
+    Returns:
+        bytes | None: 成功時は画像の生バイト。失敗時は `None`。
+
+    Notes:
+        - 拡張子や MIME の妥当性検証は行いません（上位で判断）。
+        - PDF など非対応の型チェックは呼び出し元（例: `_to_image_data_url`）で実施します。
+    """
     if isinstance(doc, str):
         try:
             with open(doc, "rb") as f:
@@ -157,7 +171,22 @@ def _load_image_bytes(doc: bytes | str) -> Optional[bytes]:
 
 
 def _azure_cv_start_analyze(endpoint: str, key: str, payload: bytes) -> Optional[str]:
-    """Read Analyze を開始し、Operation-Location を返す。失敗時 None。"""
+    """Azure Computer Vision Read Analyze を起動し、Operation-Location を返す。
+
+    Args:
+        endpoint: CV エンドポイント。例 `https://<resource>.cognitiveservices.azure.com`。
+        key: Computer Vision (Read) のサブスクリプションキー。
+        payload: 送信する画像の生バイト。
+
+    Returns:
+        str | None: `Operation-Location` の絶対URL。HTTPエラー/接続失敗/欠如時は `None`。
+
+    Notes:
+        - `POST {endpoint}/vision/{OCR_READ_VERSION}/read/analyze` に `application/octet-stream` で送信。
+        - 認証は `Ocp-Apim-Subscription-Key: <key>` ヘッダ。
+        - タイムアウトは 15 秒。
+        - 実際の結果取得は `_azure_cv_poll_result` で行います。
+    """
     analyze_url = endpoint.rstrip("/") + f"/vision/{OCR_READ_VERSION}/read/analyze"
     req = urllib.request.Request(analyze_url, method="POST")
     req.add_header("Ocp-Apim-Subscription-Key", key)
@@ -174,7 +203,22 @@ def _azure_cv_start_analyze(endpoint: str, key: str, payload: bytes) -> Optional
 
 
 def _azure_cv_poll_result(op_url: str, key: str, interval_s: float, max_tries: int) -> Optional[dict]:
-    """Operation-Location をポーリングし、成功時は結果JSONを返す。失敗/timeoutは None。"""
+    """Operation-Location をポーリングして Read の結果 JSON を取得する。
+
+    Args:
+        op_url: `_azure_cv_start_analyze` が返す Operation-Location（analyzeResults の URL）。
+        key: Computer Vision (Read) のサブスクリプションキー。
+        interval_s: ポーリング間隔（秒）。
+        max_tries: 最大試行回数。
+
+    Returns:
+        dict | None: 成功時は Read の結果 JSON。失敗・タイムアウト・例外時は `None`。
+
+    Notes:
+        - `GET <op_url>` を `Ocp-Apim-Subscription-Key` ヘッダ付きで呼び出し、`status` を判定。
+        - `status == "succeeded"` で JSON を返却、`failed` は `None`。
+        - 上位の `_azure_ocr_extract_full` で本文整形や座標抽出に利用します。
+    """
     try:
         for _ in range(max_tries):
             time.sleep(interval_s)
@@ -197,7 +241,22 @@ def _azure_cv_poll_result(op_url: str, key: str, interval_s: float, max_tries: i
 
 
 def _extract_ocr_lines(payload: dict) -> list[str]:
-    """Read結果JSONから行テキストを抽出して返す。"""
+    """Read 結果 JSON から行テキストのみを抽出するユーティリティ。
+
+    Azure Computer Vision Read API のレスポンス（`_azure_cv_poll_result` の戻り値）を受け取り、
+    `analyzeResult.readResults[].lines[].text` をページ・行順で収集します。各行は前後の空白を
+    除去し、空文字は除外します。
+
+    Args:
+        payload: Read API のレスポンス JSON。
+
+    Returns:
+        list[str]: ページ順→行順の行テキスト。座標情報は含みません。
+
+    Notes:
+        - ページ幅/高さや boundingBox が必要な場合は `_azure_ocr_extract_full` を使用してください。
+        - 想定キーが欠けていても例外を投げず、見つからなければ空リストを返します。
+    """
     lines: list[str] = []
     ar = payload.get("analyzeResult") or {}
     for page in ar.get("readResults", []) or []:
@@ -209,19 +268,40 @@ def _extract_ocr_lines(payload: dict) -> list[str]:
 
 
 def _normalize_ocr_text(lines: list[str]) -> str:
-    """改行・空行を整えたOCRテキストを返す。"""
+    """OCR の行テキストを結合・整形して単一の文字列にする。
+
+    各行の前後空白を取り除き、空行を除去したうえで改行で結合します。
+
+    Args:
+        lines: OCRで取得した生の行文字列のリスト。
+
+    Returns:
+        str: 空行を含まない整形済みの複数行テキスト。
+    """
     raw = "\n".join(lines).strip()
     return "\n".join(s for s in (ln.strip() for ln in raw.splitlines()) if s)
 
 
-def _azure_ocr_extract_text(doc: bytes | str) -> Optional[str]:
-    """Azure Computer Vision Read APIでOCRテキストを抽出する（REST）。"""
-    full = _azure_ocr_extract_full(doc)
-    return (full or {}).get("text") if full else None
-
-
 def _azure_ocr_extract_full(doc: bytes | str) -> Optional[Dict[str, Any]]:
-    """OCRの全文テキストに加えて、各行のバウンディングボックスも返す。"""
+    """Azure OCR の全文テキストと行座標を抽出する。
+
+    画像に対して Azure Computer Vision Read API を実行し、正規化済みの本文テキストと、
+    各行のテキスト/バウンディングボックス/ページ寸法を収集して返します。
+
+    Args:
+        doc: 画像ファイルのパス（str）または画像バイト（bytes）。
+
+    Returns:
+        dict | None: 成功時は以下のキーを持つ辞書。失敗時は `None`。
+            - "text": str — 正規化済みの全文テキスト（改行整形済み）
+            - "lines": list[dict] — 各行の詳細。各要素は次を含みます。
+                {"text": str, "bbox": list[int], "page_width": int|None, "page_height": int|None}
+
+    Notes:
+        - 資格情報は `AZURE_CV_ENDPOINT` と `AZURE_CV_KEY` を使用（未設定時は `None` を返します）。
+        - 実行フロー: `_load_image_bytes` → `_azure_cv_start_analyze` → `_azure_cv_poll_result`。
+        - `bbox` は [x1, y1, ..., x4, y4] の順でページ座標系の頂点を示します。
+    """
     creds = _azure_cv_credentials()
     if not creds:
         print("[tools] Azure OCR 未設定（AZURE_CV_ENDPOINT/AZURE_CV_KEY）")
@@ -268,22 +348,49 @@ def _azure_ocr_extract_full(doc: bytes | str) -> Optional[Dict[str, Any]]:
 
 
 def gpt4o_extract_material_mass(doc: bytes | str) -> Dict[str, Any]:
-    """図面画像から「材料名」と「質量(kg)」を抽出する（GPT-4o, Structured Output）。
+    """図面画像から材料名と質量(kg)を抽出する。
 
-    画像のみの1st passで不足がある場合、OCR（Azure）を併用した2nd passを試行します。
+    GPT‑4o の Structured Output を用いて抽出します。まず画像のみの 1st pass を実行し、
+    不足がある場合は `OCR_ASSIST` が有効かつ Azure CV 資格情報が設定されているときに
+    OCR（Azure Computer Vision Read）テキストを併用した 2nd pass を試行します。抽出結果には、
+    可能であれば短い根拠テキスト（evidence）が含まれ、OCR がある場合は位置の概略（%）と
+    中心 px / bbox をログ出力します。
+
+    Args:
+        doc: 画像ファイルのパス（str）または画像バイト（bytes）。
+
+    Returns:
+        Dict[str, Any]: 抽出結果の辞書。
+            - "material": str | None — 抽出された材料名。
+            - "mass_kg": float | None — 抽出・換算済み質量[kg]。
+            - "raw": dict | None — モデルの構造化出力の生データ。
+            - "evidence": dict — 根拠テキスト（"material_evidence", "mass_kg_evidence"）。
+
+    Notes:
+        - LLM は Azure OpenAI（`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`,
+          `AZURE_OPENAI_DEPLOYMENT`, 任意で `AZURE_OPENAI_API_VERSION`）で構成します。
+        - 2nd pass は `OCR_ASSIST` が true かつ `AZURE_CV_ENDPOINT`/`AZURE_CV_KEY` 設定時のみ。
+        - 例外発生や設定不足時はログを出し、material/mass_kg は None を返します。
     """
-    client, az_deployment, az_detail = _get_azure_openai_client()
-    if client is None:
+    cfg = _get_azure_openai_client()
+    if cfg is None:
         return {"material": None, "mass_kg": None, "raw": None}
+    client, az_deployment, az_detail = cfg
 
     try:
-        image_block = _to_image_data_url(doc, detail=az_detail)  # may raise if file I/O fails
+        # file I/O may raise
+        image_block = _to_image_data_url(doc, detail=az_detail)
         system = _build_system_prompt()
         user_text = _build_base_user_prompt()
 
         # 1st pass: image only
-        parts1 = _build_user_parts(user_text=user_text, image_block=image_block)
-        parsed1 = _chat_parse_material_mass(client, az_deployment, system, parts1)
+        parsed1 = _run_first_pass(
+            client=client,
+            model=az_deployment,
+            system=system,
+            user_text=user_text,
+            image_block=image_block,
+        )
         if _is_complete(parsed1):
             print("[tools] gpt4o_extract_material_mass: Structured Output (image only)")
             _log_evidence(parsed1)
@@ -299,10 +406,14 @@ def gpt4o_extract_material_mass(doc: bytes | str) -> Dict[str, Any]:
             _log_2nd_pass_reasons(parsed1)
             ocr_full = _azure_ocr_extract_full(doc)
             if ocr_full and ocr_full.get("text"):
-                parts2 = _build_user_parts_with_ocr(
-                    user_text=user_text, image_block=image_block, ocr_text=ocr_full["text"]
+                parsed2 = _run_second_pass(
+                    client=client,
+                    model=az_deployment,
+                    system=system,
+                    user_text=user_text,
+                    image_block=image_block,
+                    ocr_text=ocr_full["text"],
                 )
-                parsed2 = _chat_parse_material_mass(client, az_deployment, system, parts2)
                 if parsed2:
                     print("[tools] gpt4o_extract_material_mass: Structured Output (with OCR)")
                     _log_evidence(parsed2)
@@ -319,8 +430,22 @@ def gpt4o_extract_material_mass(doc: bytes | str) -> Dict[str, Any]:
         return {"material": None, "mass_kg": None, "raw": None}
 
 
-# ===== Internal helpers for GPT-4o extraction =====
-def _get_azure_openai_client():
+def _get_azure_openai_client() -> Optional[tuple[Any, str, str]]:
+    """Azure OpenAIクライアントと設定値を取得する。
+
+    環境変数からAzure OpenAIを初期化し、クライアント、デプロイメント名、
+    画像 `detail` 設定を返します。必須の環境変数が不足している場合は `None` を返します。
+
+    Returns:
+        tuple[Any, str, str] | None: `(client, deployment, detail)`。
+            - `client`: `openai.AzureOpenAI` のインスタンス
+            - `deployment`: Azure OpenAI のデプロイメント名（モデル指定）
+            - `detail`: 画像詳細レベル（例: "high"）
+
+    Notes:
+        - 使用環境変数: `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`,
+          `AZURE_OPENAI_DEPLOYMENT`, 任意で `AZURE_OPENAI_API_VERSION`, `AZURE_OPENAI_DETAIL`。
+    """
     az_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     az_key = os.getenv("AZURE_OPENAI_API_KEY")
     az_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
@@ -328,7 +453,7 @@ def _get_azure_openai_client():
     az_detail = os.getenv("AZURE_OPENAI_DETAIL", "high")
     if not (az_endpoint and az_key and az_deployment):
         print("[tools] GPT-4o設定不足。material/mass_kgはNoneで返却")
-        return None, None, None
+        return None
     from openai import AzureOpenAI  # type: ignore
 
     client = AzureOpenAI(api_key=az_key, api_version=az_api_version, azure_endpoint=az_endpoint)
@@ -368,6 +493,28 @@ def _build_user_parts_with_ocr(*, user_text: str, image_block: Dict[str, Any], o
         {"type": "text", "text": assist},
         image_block,
     ]
+
+
+def _run_first_pass(
+    *, client, model: str, system: str, user_text: str, image_block: Dict[str, Any]
+) -> Optional[MaterialMassOutput]:
+    """画像のみで Structured Output を得る 1st pass を実行する。"""
+    parts = _build_user_parts(user_text=user_text, image_block=image_block)
+    return _chat_parse_material_mass(client, model, system, parts)
+
+
+def _run_second_pass(
+    *,
+    client,
+    model: str,
+    system: str,
+    user_text: str,
+    image_block: Dict[str, Any],
+    ocr_text: str,
+) -> Optional[MaterialMassOutput]:
+    """OCR テキストを併用して Structured Output を得る 2nd pass を実行する。"""
+    parts = _build_user_parts_with_ocr(user_text=user_text, image_block=image_block, ocr_text=ocr_text)
+    return _chat_parse_material_mass(client, model, system, parts)
 
 
 def _chat_parse_material_mass(client, model: str, system: str, parts: list[dict[str, Any]]):
