@@ -1010,7 +1010,26 @@ def _estimate_mass_confidence(
 def _compute_confidence_bundle(
     parsed: MaterialMassOutput, ocr_lines: Optional[list[Dict[str, Any]]]
 ) -> Dict[str, Any]:
-    """項目別の信頼度とoverallをまとめて計算する。"""
+    """事後推定ヒューリスティックで信頼度を集計し、バンドル化する。
+
+    材料と質量それぞれの信頼度を `_estimate_material_confidence`／`_estimate_mass_confidence`
+    で算出し、その平均を `overall` として返します。OCR行 `ocr_lines` は任意で、
+    与えられた場合は evidence とOCRの重なりに基づく加点が反映されます。
+
+    Args:
+        parsed: 構造化応答（`material`/`mass_kg` と各 evidence を参照）。
+        ocr_lines: Azure OCR の行情報（`text`/`bbox`/`page_width`/`page_height`）の配列、または `None`。
+
+    Returns:
+        Dict[str, Any]: 次のキーを持つ信頼度バンドル。
+            - `material`: float — 材料の信頼度（0.0–1.0）
+            - `mass_kg`: float — 質量の信頼度（0.0–1.0）
+            - `overall`: float — 上記2つの平均（0.0–1.0）
+
+    Notes:
+        - 主に 2nd pass（OCR併用）の評価で使用します。
+        - 1st pass（画像のみ）ではモデル自己申告の `_build_model_confidence_bundle` を使用します。
+    """
     mat_score, _ = _estimate_material_confidence(parsed, ocr_lines)
     mass_score, _ = _estimate_mass_confidence(parsed, ocr_lines)
     overall = float((mat_score + mass_score) / 2.0)
@@ -1024,8 +1043,16 @@ def _compute_confidence_bundle(
 def _build_model_confidence_bundle(parsed: MaterialMassOutput) -> Dict[str, Any]:
     """モデル自己申告の信頼度からバンドルを構築する（1st pass 用）。
 
-    従来のヒューリスティックは用いず、`material_confidence` / `mass_confidence` のみで
-    overall を算出します。どちらかが欠落している場合は overall は `None`。
+    `MaterialMassOutput` が持つ `material_confidence` と `mass_confidence` をそのまま用い、
+    利用可能な要素の平均を `overall` として計算します（片方のみでも平均に採用）。
+    いずれの値も無い場合は `overall` は `None` となります。ヒューリスティック加点や
+    クリップ処理は行いません。
+
+    Args:
+        parsed: モデルの構造化応答（自己申告信頼度フィールドを含み得る）。
+
+    Returns:
+        Dict[str, Any]: `{"material": float|None, "mass_kg": float|None, "overall": float|None}`。
     """
     mat = getattr(parsed, "material_confidence", None)
     mass = getattr(parsed, "mass_confidence", None)
@@ -1045,7 +1072,19 @@ def _build_model_confidence_bundle(parsed: MaterialMassOutput) -> Dict[str, Any]
 
 
 def _log_model_first_pass_confidence(conf: Dict[str, Any]) -> None:
-    """モデル自己申告の1st pass信頼度をログ出力する。"""
+    """モデル自己申告の 1st pass 信頼度を整形してログ出力する。
+
+    入力 `conf` は `_build_model_confidence_bundle` が返す辞書を想定し、
+    `material` と `mass_kg` をそれぞれ小数2桁に整形して出力します。
+    値が存在しない場合は `(none)` と表示します。ログ用途のため、
+    内部で例外が発生しても握りつぶして処理を継続します。
+
+    Args:
+        conf: `{"material": float|None, "mass_kg": float|None, "overall": float|None}` を想定する辞書。
+
+    Returns:
+        None
+    """
     try:
         m = conf.get("material")
         k = conf.get("mass_kg")
@@ -1059,7 +1098,23 @@ def _log_model_first_pass_confidence(conf: Dict[str, Any]) -> None:
 
 
 def _log_second_pass_confidence(parsed: MaterialMassOutput, ocr_lines: Optional[list[Dict[str, Any]]]) -> None:
-    """2nd pass の抽出結果に基づく項目別信頼度をログ出力する。"""
+    """2nd pass の項目別信頼度を整形してログ出力する。
+
+    `parsed`（2nd pass の構造化応答）から、事後推定ヒューリスティック
+   （`_estimate_material_confidence`／`_estimate_mass_confidence`）で material と
+    mass_kg のスコアを算出し、それぞれの basis（根拠内訳）とともに 1 行で出力します。
+    `ocr_lines` が与えられていれば、OCR 重なりに基づく加点もスコアに反映されます。
+
+    Args:
+        parsed: 2nd pass の構造化応答（evidence を含む可能性あり）。
+        ocr_lines: Azure OCR の行情報（`text`/`bbox`/`page_width`/`page_height`）配列、または `None`。
+
+    Returns:
+        None
+
+    Notes:
+        - ログ用途のため、内部例外は握りつぶして処理を継続します。
+    """
     try:
         mat_score, mat_basis = _estimate_material_confidence(parsed, ocr_lines)
         mass_score, mass_basis = _estimate_mass_confidence(parsed, ocr_lines)
