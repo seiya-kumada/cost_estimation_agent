@@ -82,18 +82,38 @@ def human_in_the_loop_node(state: EstimationState) -> EstimationState:
     extracted = dict(state.get("extracted") or {})
     material = extracted.get("material")
     mass_kg = extracted.get("mass_kg")
-    conf = state.get("extraction_confidence", 0.0)
+    conf_overall = state.get("extraction_confidence", 0.0)
+    conf_bundle = {}
+    try:
+        # tools → extractor で渡している詳細信頼度（material/mass_kg/overall）
+        conf_bundle = dict(extracted.get("confidence") or {})
+    except Exception:
+        conf_bundle = {}
+    conf_mat = conf_bundle.get("material")
+    conf_mass = conf_bundle.get("mass_kg")
 
     print("[node] human_review: 読み取り結果の確認を行います。")
     print(f"  - 材料(material): {material}")
     print(f"  - 質量(mass_kg): {mass_kg}")
-    print(f"  - 信頼度(confidence): {conf:.2f}")
+    # 項目別の信頼度を表示（平均値ではなく個別）
+    if isinstance(conf_mat, (int, float)):
+        print(f"  - 信頼度(material): {float(conf_mat):.2f}")
+    if isinstance(conf_mass, (int, float)):
+        print(f"  - 信頼度(mass_kg): {float(conf_mass):.2f}")
+    # フォールバックとして、項目別が無い場合のみoverallを表示
+    if not isinstance(conf_mat, (int, float)) and not isinstance(conf_mass, (int, float)):
+        if isinstance(conf_bundle.get("overall"), (int, float)):
+            print(f"  - 参考(overall): {float(conf_bundle['overall']):.2f}")
+        elif isinstance(conf_overall, (int, float)):
+            print(f"  - 参考(overall): {float(conf_overall):.2f}")
 
     ok = _prompt_yes_no("この読み取り結果で問題ありませんか？")
     if ok:
         state["needs_human"] = False
         # 問題なしの場合は信頼度を少し引き上げる
-        state["extraction_confidence"] = max(conf, 0.9)
+        # overall を引き上げ（詳細スコアはそのまま）
+        base_overall = conf_bundle.get("overall", conf_overall)
+        state["extraction_confidence"] = max(float(base_overall if isinstance(base_overall, (int, float)) else 0.0), 0.9)
         state["extraction_issues"] = []
         print("[node] human_review: ユーザ確認でOK。次工程へ進みます。")
         return state

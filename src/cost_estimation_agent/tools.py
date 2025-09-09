@@ -74,6 +74,10 @@ class MaterialMassOutput(BaseModel):
     Attributes:
         material: 抽出された材料名（例: "SUS304"）。不明な場合は `None`。
         mass_kg: 抽出・換算済みの質量[kg]。不明な場合は `None`。
+        material_evidence: 材料名の根拠として用いた短いテキスト断片（任意）。
+        mass_kg_evidence: 質量の根拠として用いた短いテキスト断片（任意）。
+        material_confidence: モデル自己申告の材料に関する信頼度（0.0〜1.0、任意）。
+        mass_confidence: モデル自己申告の質量に関する信頼度（0.0〜1.0、任意）。
     """
 
     material: Optional[str] = None
@@ -81,6 +85,9 @@ class MaterialMassOutput(BaseModel):
     # Optional evidence snippets (short text from the drawing/OCR supporting each value)
     material_evidence: Optional[str] = None
     mass_kg_evidence: Optional[str] = None
+    # Model self-reported confidences (0.0–1.0)
+    material_confidence: Optional[float] = None
+    mass_confidence: Optional[float] = None
 
 
 def _to_image_data_url(doc: bytes | str, detail: str = "high") -> Dict[str, Any]:
@@ -350,11 +357,10 @@ def _extract_full_ocr_result(doc: bytes | str) -> Optional[Dict[str, Any]]:
 def extract_material_mass_via_gpt4o(doc: bytes | str) -> Dict[str, Any]:
     """図面画像から材料名と質量(kg)を抽出する。
 
-    GPT‑4o の Structured Output を用いて抽出します。まず画像のみの 1st pass を実行し、
-    不足がある場合は `OCR_ASSIST` が有効かつ Azure CV 資格情報が設定されているときに
-    OCR（Azure Computer Vision Read）テキストを併用した 2nd pass を試行します。抽出結果には、
-    可能であれば短い根拠テキスト（evidence）が含まれ、OCR がある場合は位置の概略（%）と
-    中心 px / bbox をログ出力します。
+    概要:
+    - 1st pass: 画像のみで GPT‑4o の Structured Output を取得
+    - 2nd pass: 不足時のみ、`OCR_ASSIST` 有効かつ資格情報ありで Azure OCR テキストを併用
+    - 可能なら短い根拠テキスト（evidence）を含め、OCRがある場合は概略位置（%）や bbox をログ出力
 
     Args:
         doc: 画像ファイルのパス（str）または画像バイト（bytes）。
@@ -364,7 +370,15 @@ def extract_material_mass_via_gpt4o(doc: bytes | str) -> Dict[str, Any]:
             - "material": str | None — 抽出された材料名。
             - "mass_kg": float | None — 抽出・換算済み質量[kg]。
             - "raw": dict | None — モデルの構造化出力の生データ。
-            - "evidence": dict — 根拠テキスト（"material_evidence", "mass_kg_evidence"）。
+            - "evidence": dict | None — 根拠テキスト（"material_evidence", "mass_kg_evidence"）。
+            - "confidence": dict | None — 項目別および overall の信頼度（{material, mass_kg, overall}）。
+
+    信頼度の扱い:
+        - 1st pass: モデル自己申告の `material_confidence` / `mass_confidence` を採用し、
+          利用可能な値の平均を `overall` とします（片方欠落時は取得できた側のみで平均）。
+        - 2nd pass: OCR重なり・材料DBヒット・単位チェック等の事後ヒューリスティックで算出し、
+          material/mass_kg の平均を `overall` とします。
+        - いずれも状況により `confidence` は `None`（または一部フィールド欠落）になり得ます。
 
     Notes:
         - LLM は Azure OpenAI（`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`,
@@ -394,12 +408,11 @@ def extract_material_mass_via_gpt4o(doc: bytes | str) -> Dict[str, Any]:
         if _is_complete(parsed1) and parsed1 is not None:
             print("[tools] extract_material_mass_via_gpt4o: Structured Output (image only)")
             _log_evidence(parsed1)
-            # 1st pass 成功時も、可能ならOCRの座標から大まかな位置を推定して表示
-            if _is_ocr_assist_enabled():
-                ocr_full_1st = _extract_full_ocr_result(doc)
-                if ocr_full_1st and ocr_full_1st.get("lines"):
-                    _log_locations_from_ocr(parsed1, ocr_full_1st["lines"])
-            return _to_result(parsed1)
+
+            # 1st pass の信頼度は LLM 自己申告を採用
+            conf_bundle_1st = _build_model_confidence_bundle(parsed1)
+            _log_model_first_pass_confidence(conf_bundle_1st)
+            return _to_result(parsed1, confidence=conf_bundle_1st)
 
         # 2nd pass: GPT-4o with OCR-assisted text (Azure OCR as source)
         if _is_ocr_assist_enabled():
@@ -418,8 +431,11 @@ def extract_material_mass_via_gpt4o(doc: bytes | str) -> Dict[str, Any]:
                     print("[tools] extract_material_mass_via_gpt4o: Structured Output (with OCR)")
                     _log_evidence(parsed2)
                     # 位置推定（OCR行の座標から大まかな方位を推測）
-                    _log_locations_from_ocr(parsed2, ocr_full.get("lines") or [])
-                    return _to_result(parsed2)
+                    ocr_lines_2nd = ocr_full.get("lines") or []
+                    _log_locations_from_ocr(parsed2, ocr_lines_2nd)
+                    _log_second_pass_confidence(parsed2, ocr_lines_2nd)
+                    conf_bundle_2nd = _compute_confidence_bundle(parsed2, ocr_lines_2nd)
+                    return _to_result(parsed2, confidence=conf_bundle_2nd)
             else:
                 print("[tools] extract_material_mass_via_gpt4o: 2nd pass skipped (no OCR text)")
 
@@ -491,6 +507,10 @@ def _build_base_user_prompt() -> str:
         "単位がkg以外ならkgへ変換し、小数3桁程度に丸めてください。"
         "可能であれば、各項目を裏付ける短いテキスト断片をそれぞれ"
         "material_evidence と mass_kg_evidence に含めてください（最大50文字程度）。"
+        "さらに、各値の確からしさを 0.0〜1.0 の実数で material_confidence / mass_confidence に記入してください。"
+        "「材質」「材料」などの語句の近傍にある文字列は材料名である確率が高いです。"
+        "「質量」「重量」「kg」「g」などの語句の近傍にある語句は質量である確率が高いです。"
+        "1.0=明確に図面上で根拠が確認できる、0.0=断定不能 とし、中間は根拠の明確さや曖昧さに応じて一貫して採点してください。"
     )
 
 
@@ -642,20 +662,28 @@ def _is_complete(parsed: Optional[MaterialMassOutput]) -> bool:
     return bool(parsed and (parsed.material is not None) and (parsed.mass_kg is not None))
 
 
-def _to_result(parsed: MaterialMassOutput) -> Dict[str, Any]:
-    """Pydantic出力を最終的な辞書形式に整形する。
+def _to_result(parsed: MaterialMassOutput, *, confidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """構造化応答を最終返却用の辞書に整形する。
 
-    `MaterialMassOutput`（構造化応答）から、呼び出し側へ返す辞書を生成します。
-    抽出値に加えて、モデルの生データ(`raw`)と可能なら evidence 断片を含めます。
+    `MaterialMassOutput`（Pydantic）から、呼び出し側へ返す辞書を生成します。
+    返却値は抽出値に加えて、モデルの生データ（`raw`）と `evidence` を含みます。
+    `evidence` フィールド自体は常に含めますが、各値は未取得の場合に `None` になり得ます。
+    `confidence` は指定されたときのみ含めます。
 
     Args:
-        parsed: 構造化応答のPydanticモデル。完成済みを想定。
+        parsed: 構造化応答の Pydantic モデル。
+        confidence: 項目別の信頼度バンドル（例: {"material": float|None, "mass_kg": float|None, "overall": float|None}）。
+            未指定の場合は返却辞書に含めません。
 
     Returns:
-        Dict[str, Any]: `material`, `mass_kg`, `raw`, `evidence` を含む辞書。
-            - `evidence` は `material_evidence`, `mass_kg_evidence` を持ち、存在しない場合は `None`。
+        Dict[str, Any]: 次のキーを持つ辞書。
+            - `material`: str | None — 抽出された材料名。
+            - `mass_kg`: float | None — 抽出・換算済みの質量[kg]。
+            - `raw`: dict — `parsed.model_dump(mode="json")` によるモデルの生データ。
+            - `evidence`: dict — `material_evidence` / `mass_kg_evidence` を格納（値は None 可）。
+            - `confidence`: dict | 省略 — 指定時のみ追加（material/mass_kg/overall を想定）。
     """
-    return {
+    out = {
         "material": parsed.material,
         "mass_kg": parsed.mass_kg,
         "raw": parsed.model_dump(mode="json"),
@@ -664,6 +692,9 @@ def _to_result(parsed: MaterialMassOutput) -> Dict[str, Any]:
             "mass_kg_evidence": getattr(parsed, "mass_kg_evidence", None),
         },
     }
+    if confidence is not None:
+        out["confidence"] = confidence
+    return out
 
 
 def _is_ocr_assist_enabled() -> bool:
@@ -698,7 +729,9 @@ def _log_2nd_pass_reasons(parsed: Optional[MaterialMassOutput]) -> None:
             reasons.append("material missing")
         if parsed.mass_kg is None:
             reasons.append("mass_kg missing")
-    print(f"[tools] extract_material_mass_via_gpt4o: 2nd pass (OCR) trigger reasons: {', '.join(reasons) or 'unknown'}")
+    print(
+        f"[tools] extract_material_mass_via_gpt4o: 2nd pass (OCR) trigger reasons: {', '.join(reasons) or 'unknown'}"
+    )
 
 
 def _log_evidence(parsed: MaterialMassOutput) -> None:
@@ -805,6 +838,238 @@ def _locate_evidence_in_ocr(evidence: str, ocr_lines: list[Dict[str, Any]]) -> O
         return f"{pos}（~{int(rx * 100)}%, ~{int(ry * 100)}%） " f"center=({int(cx)},{int(cy)})px bbox={bbox}"
     except Exception:
         return None
+
+
+def _evaluate_ocr_overlap(evidence: Optional[str], ocr_lines: Optional[list[Dict[str, Any]]]) -> float:
+    """OCR行とevidenceの重なり度合いを0.0–1.0で評価する。
+
+    evidence をトークン化して各OCR行と比較し、最大の重なり率（overlap/len(evidence_tokens)）
+    を返します。OCRが無い、または evidence が無い場合は 0.0 を返します。
+
+    Args:
+        evidence: 抽出根拠テキスト。
+        ocr_lines: Azure OCR の行情報リスト。
+
+    Returns:
+        float: 0.0〜1.0 の重なりスコア。
+    """
+    if not evidence or not ocr_lines:
+        return 0.0
+    ev = str(evidence).strip().lower()
+    if not ev:
+        return 0.0
+    ev_tokens = [t for t in ev.replace("kg", " kg ").split() if t]
+    if not ev_tokens:
+        return 0.0
+    best = 0.0
+    for ln in ocr_lines:
+        text = str((ln or {}).get("text") or "").lower()
+        if not text:
+            continue
+        if ev in text:
+            # 文字列として含まれる場合は高スコア（上限1.0）
+            best = max(best, 1.0)
+            continue
+        ln_tokens = [t for t in text.replace("kg", " kg ").split() if t]
+        if not ln_tokens:
+            continue
+        overlap = len(set(ev_tokens) & set(ln_tokens))
+        best = max(best, overlap / max(len(ev_tokens), 1))
+        if best >= 1.0:
+            break
+    return float(max(0.0, min(1.0, best)))
+
+
+def _check_material_in_db(name: Optional[str]) -> bool:
+    """材料名が材料単価DBに存在するかを判定する。
+
+    adapters.materials の `query_materials_db` を用いて、与えられた材料名が
+    単価DBに登録されているかを真偽で返します。`name` が空/None の場合や、
+    参照中に例外が発生した場合は `False` を返します。
+
+    Args:
+        name: 照会する材料名（例: "SUS304", "A5052"）。空/None は未指定とみなす。
+
+    Returns:
+        bool: DBで見つかれば `True`、それ以外は `False`。
+
+    Notes:
+        - 実体は `query_materials_db` に委譲します。照合は内部で正規化されるため、
+          大文字小文字・全角半角の表記ゆれにある程度耐性があります。
+        - 例外は握りつぶして `False` を返し、上位のスコアリングでの加点のみを抑制します。
+    """
+    if not name:
+        return False
+    try:
+        res = query_materials_db(name)
+        return bool(res.get("found"))
+    except Exception:
+        return False
+
+
+def _estimate_material_confidence(
+    parsed: MaterialMassOutput, ocr_lines: Optional[list[Dict[str, Any]]]
+) -> tuple[float, list[str]]:
+    """材料の信頼度を事後推定する（OCR行を任意で利用）。
+
+    スコアリングルール（上限1.0、最終的に0.0〜1.0へクリップ）:
+    - +0.50: `material` の値が存在する
+    - +0.20: `material_evidence` が存在する
+    - +0.20: 材料DBヒット（`query_materials_db(material)` が found）
+    - +0.00〜+0.20: OCR重なり — `material_evidence` と OCR 行の重なり率 ov∈[0,1] に比例（0.2×ov）
+
+    根拠は短い文字列の配列 `basis` として返し、例えば
+    `["value", "evidence", "db_hit", "ocr_overlap=0.73"]` の形式になります。
+
+    Args:
+        parsed: 構造化応答（`material` と `material_evidence` を参照）。
+        ocr_lines: Azure OCR の行情報（`text`/`bbox`/`page_width`/`page_height` を含む辞書の配列）
+            または `None`（未使用）。
+
+    Returns:
+        tuple[float, list[str]]: `(score, basis)` のタプル。
+
+    Notes:
+        - 1st pass では LLM の自己申告信頼度を採用しており、本関数は主に 2nd pass の評価に用います。
+        - OCR が無い場合は重なり加点は 0 になり、他の加点のみでスコアが決まります。
+    """
+    score = 0.0
+    basis: list[str] = []
+    mat = getattr(parsed, "material", None)
+    ev = getattr(parsed, "material_evidence", None)
+
+    if mat:
+        score += 0.5
+        basis.append("value")
+    if ev:
+        score += 0.2
+        basis.append("evidence")
+    if _check_material_in_db(mat):
+        score += 0.2
+        basis.append("db_hit")
+    ov = _evaluate_ocr_overlap(ev, ocr_lines)
+    if ov > 0:
+        # 最大+0.2（重なりに比例）
+        add = 0.2 * ov
+        score += add
+        basis.append(f"ocr_overlap={ov:.2f}")
+    score = float(max(0.0, min(1.0, score)))
+    return score, basis
+
+
+def _estimate_mass_confidence(
+    parsed: MaterialMassOutput, ocr_lines: Optional[list[Dict[str, Any]]]
+) -> tuple[float, list[str]]:
+    """質量(kg)の信頼度を事後推定する（OCR行を任意で利用）。
+
+    スコアリングルール（上限1.0、最終的に0.0〜1.0へクリップ）:
+    - +0.50: `mass_kg` の値が存在する
+    - +0.20: `mass_kg_evidence` に「kg/ｋｇ」が含まれる（単位明示）
+    - +0.10: `mass_kg` が正の数（妥当性の簡易チェック）
+    - +0.00〜+0.20: OCR重なり — `mass_kg_evidence` と OCR 行の重なり率 ov∈[0,1] に比例（0.2×ov）
+
+    根拠は短い文字列の配列 `basis` として返し、例えば
+    `["value", "unit_kg", "plausible", "ocr_overlap=0.78"]` の形式になります。
+
+    Args:
+        parsed: 構造化応答（`mass_kg` と `mass_kg_evidence` を参照）。
+        ocr_lines: Azure OCR の行情報（`text`/`bbox`/`page_width`/`page_height` を含む辞書の配列）
+            または `None`（未使用）。
+
+    Returns:
+        tuple[float, list[str]]: `(score, basis)` のタプル。
+
+    Notes:
+        - 1st pass では LLM の自己申告信頼度を採用しており、本関数は主に 2nd pass の評価に用います。
+        - OCR が無い場合は重なり加点は 0 になり、他の加点のみでスコアが決まります。
+    """
+    score = 0.0
+    basis: list[str] = []
+    mass = getattr(parsed, "mass_kg", None)
+    ev = getattr(parsed, "mass_kg_evidence", None)
+
+    if mass is not None:
+        score += 0.5
+        basis.append("value")
+    ev_l = str(ev or "").lower()
+    if ev and ("kg" in ev_l or "ｋｇ" in ev_l):
+        score += 0.2
+        basis.append("unit_kg")
+    if isinstance(mass, (int, float)) and mass > 0:
+        score += 0.1
+        basis.append("plausible")
+    ov = _evaluate_ocr_overlap(ev, ocr_lines)
+    if ov > 0:
+        add = 0.2 * ov
+        score += add
+        basis.append(f"ocr_overlap={ov:.2f}")
+    score = float(max(0.0, min(1.0, score)))
+    return score, basis
+
+
+def _compute_confidence_bundle(
+    parsed: MaterialMassOutput, ocr_lines: Optional[list[Dict[str, Any]]]
+) -> Dict[str, Any]:
+    """項目別の信頼度とoverallをまとめて計算する。"""
+    mat_score, _ = _estimate_material_confidence(parsed, ocr_lines)
+    mass_score, _ = _estimate_mass_confidence(parsed, ocr_lines)
+    overall = float((mat_score + mass_score) / 2.0)
+    return {
+        "material": mat_score,
+        "mass_kg": mass_score,
+        "overall": overall,
+    }
+
+
+def _build_model_confidence_bundle(parsed: MaterialMassOutput) -> Dict[str, Any]:
+    """モデル自己申告の信頼度からバンドルを構築する（1st pass 用）。
+
+    従来のヒューリスティックは用いず、`material_confidence` / `mass_confidence` のみで
+    overall を算出します。どちらかが欠落している場合は overall は `None`。
+    """
+    mat = getattr(parsed, "material_confidence", None)
+    mass = getattr(parsed, "mass_confidence", None)
+    # overall は取得できた要素の平均（片方のみでも採用する）。
+    vals: list[float] = []
+    if isinstance(mat, (int, float)):
+        vals.append(float(mat))
+    if isinstance(mass, (int, float)):
+        vals.append(float(mass))
+    overall: Optional[float] = (sum(vals) / len(vals)) if vals else None
+    out: Dict[str, Any] = {
+        "material": float(mat) if isinstance(mat, (int, float)) else None,
+        "mass_kg": float(mass) if isinstance(mass, (int, float)) else None,
+        "overall": overall,
+    }
+    return out
+
+
+def _log_model_first_pass_confidence(conf: Dict[str, Any]) -> None:
+    """モデル自己申告の1st pass信頼度をログ出力する。"""
+    try:
+        m = conf.get("material")
+        k = conf.get("mass_kg")
+
+        def fmt(x):
+            return f"{float(x):.2f}" if isinstance(x, (int, float)) else "(none)"
+
+        print("[tools] confidence(1st-model): " f"material={fmt(m)} mass_kg={fmt(k)}")
+    except Exception:
+        pass
+
+
+def _log_second_pass_confidence(parsed: MaterialMassOutput, ocr_lines: Optional[list[Dict[str, Any]]]) -> None:
+    """2nd pass の抽出結果に基づく項目別信頼度をログ出力する。"""
+    try:
+        mat_score, mat_basis = _estimate_material_confidence(parsed, ocr_lines)
+        mass_score, mass_basis = _estimate_mass_confidence(parsed, ocr_lines)
+        print(
+            "[tools] confidence(2nd): "
+            f"material={mat_score:.2f} basis=[{', '.join(mat_basis)}] "
+            f"mass_kg={mass_score:.2f} basis=[{', '.join(mass_basis)}]"
+        )
+    except Exception:
+        pass
 
 
 __all__ = [

@@ -37,6 +37,11 @@ def extractor_node(state: EstimationState) -> EstimationState:
         extracted["material"] = material
         extracted["mass_kg"] = mass_kg
         extracted["llm_raw"] = res.get("raw")
+        # 新方式の信頼度（toolsの出力）を優先して取り込む
+        conf_bundle = (res.get("confidence") or {}) if isinstance(res, dict) else {}
+        if conf_bundle:
+            extracted["confidence"] = conf_bundle  # 項目別の信頼度を保持（human_review で表示用）
+        new_overall = conf_bundle.get("overall")
 
         # 取得きなかった項目をissuesに追加する
         if not material:
@@ -44,11 +49,15 @@ def extractor_node(state: EstimationState) -> EstimationState:
         if mass_kg is None:
             issues.append("mass_kg")
 
-        # issuesが空なら高信頼(0.9)、1つなら中信頼(0.5)、2つなら低信頼(0.1)
-        if not issues:
-            conf = 0.9
-        elif len(issues) == 1:
-            conf = 0.5
+        # 新方式があればそれを優先、無ければ従来ヒューリスティック
+        if isinstance(new_overall, (int, float)):
+            conf = float(new_overall)
+        else:
+            # issuesが空なら高信頼(0.9)、1つなら中信頼(0.5)、2つなら低信頼(0.1)
+            if not issues:
+                conf = 0.9
+            elif len(issues) == 1:
+                conf = 0.5
     except Exception as e:
         issues = ["material", "mass_kg"]
         conf = 0.1

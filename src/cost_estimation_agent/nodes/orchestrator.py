@@ -1,31 +1,32 @@
 from ..state import EstimationState
 from ._utils import record_node_trace
 
-# Confidence threshold to trigger human review
+# Confidence threshold to trigger human review (currently ignored)
 CONFIDENCE_THRESHOLD = 0.95
 
 
 def orchestrator_node(state: EstimationState) -> EstimationState:
-    """抽出結果を評価し、人手確認の要否を決定するノード。
+    """抽出結果に関わらず、必ず人手確認を要求するノード。
 
     振る舞い:
-    - `extraction_confidence` と `extraction_issues` を参照して Need-HITL を判定
-      - しきい値: `extraction_confidence < CONFIDENCE_THRESHOLD` または `extraction_issues` が非空なら `needs_human=True`
-    - 判定結果を `state["needs_human"]` に設定
-    - トレースに "orchestrator" を追加し、判定内容をログ出力
+    - 以前は `extraction_confidence` と `extraction_issues` に基づき分岐していましたが、
+      現在は必ず `needs_human=True` を設定して HITL を実施します。
+    - トレースに "orchestrator" を追加し、従来条件（low_conf/missing）も参考としてログ出力します。
 
     Args:
     - state: エージェントの共有状態。
 
     Returns:
-    - EstimationState: 変更を反映した状態（`needs_human` と `trace` が更新されます）。
+    - EstimationState: `needs_human=True` を反映した状態。
     """
-    # しきい値判定＆人手確認の要否（閾値は CONFIDENCE_THRESHOLD）
+    # 従来条件を計算（ログ用）。判定自体は強制的に True。
     low_conf = state.get("extraction_confidence", 0) < CONFIDENCE_THRESHOLD
-    missing = bool(state.get("extraction_issues"))  # listが空でなければTrue
-    state["needs_human"] = low_conf or missing
+    missing = bool(state.get("extraction_issues"))
+    state["needs_human"] = True
     record_node_trace(state, "orchestrator")
-    print(f"[node] orchestrator: low_conf={low_conf} missing={missing} -> needs_human={state['needs_human']}")
+    print(
+        f"[node] orchestrator: low_conf={low_conf} missing={missing} -> needs_human=True (forced)"
+    )
     return state
 
 
