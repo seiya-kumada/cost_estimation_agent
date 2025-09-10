@@ -107,19 +107,21 @@ def human_in_the_loop_node(state: EstimationState) -> EstimationState:
         elif isinstance(conf_overall, (int, float)):
             print(f"  - 参考(overall): {float(conf_overall):.2f}")
 
-    ok = _prompt_yes_no("この読み取り結果で問題ありませんか？")
+    ok = _prompt_yes_no("この読み取り結果は正しいですか？")
     if ok:
         state["needs_human"] = False
         # 問題なしの場合は信頼度を少し引き上げる
         # overall を引き上げ（詳細スコアはそのまま）
         base_overall = conf_bundle.get("overall", conf_overall)
-        state["extraction_confidence"] = max(float(base_overall if isinstance(base_overall, (int, float)) else 0.0), 0.9)
+        state["extraction_confidence"] = max(
+            float(base_overall if isinstance(base_overall, (int, float)) else 0.0), 0.9
+        )
         state["extraction_issues"] = []
         print("[node] human_review: ユーザ確認でOK。次工程へ進みます。")
         return state
 
     # ユーザ修正フロー
-    print("[node] human_review: 修正入力をお願いします。未指定は空Enterで保持します。")
+    print("[node] human_review: 修正入力をお願いします。未指定の場合は現在の値を保持します。")
     new_material = input("材料（例: SUS304, A5052, SS400）: ").strip()
     if new_material:
         extracted["material"] = new_material
